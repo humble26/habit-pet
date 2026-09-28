@@ -1,0 +1,31 @@
+{
+  "repos": [
+    "E:\\path\\to\\your\\repo",
+    "C:\\Users\\you\\projects\\another-repo"
+  ],
+  "git_poll_seconds": 300,
+  "llm": {
+    "enabled": true,
+    "api_key": "",
+    "model": "glm-4-flash",
+    "base_url": "https://open.bigmodel.cn/api/paas/v4/chat/completions",
+    "daily_roast_hour": 21,
+    "daily_roast_minute": 30
+  },
+  "mechanics": {
+    "satiety_decay_per_hour": 4.0,
+    "commit_feed": 14.0,
+    "commit_mood": 3.0,
+    "treat_feed": 20.0,
+    "sit_limit_minutes": 45,
+    "sit_damage": 8.0,
+    "break_rest_minutes": 10,
+    "break_regen": 5.0,
+    "late_night_start": 0,
+    "late_night_end": 6,
+    "late_night_drain_per_hour": 3.0,
+    "focus_minutes": 25,
+    "focus_grace_minutes": 10,
+    "focus_reward_mood": 10.0
+  }
+}

@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+dist/
+build/
+
+# 本地个人配置（含你的仓库路径与 LLM Key），不入库
+config.json
+.habitpet/
+*.log

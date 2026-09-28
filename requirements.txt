@@ -1,0 +1,4 @@
+# 除 requests 外全部为标准库（tkinter / ctypes / json / git 命令行）
+requests>=2.31
+# 可选：仅用于生成周报分享卡（未安装时该功能自动停用，其余不受影响）
+# pillow>=10.0
