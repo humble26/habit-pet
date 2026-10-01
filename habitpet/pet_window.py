@@ -4,8 +4,9 @@
   按成长阶段缩放；透明走色键（whale_art.KEY_HEX）。
 - 交互并入 DSH 小鲸鱼挂件的玩法：按压 Q 弹 + 音效、松开回弹、
   拖拽贴边吸附（贴左时水平镜像）、点按触发 rua 动图。
-- 位置限制：拖动/恢复/松手全程把窗口夹在屏幕内（到边就停，鲸鱼娘不会
-  被拖出屏幕；底部留出任务栏高度）。
+- 位置限制：拖动/恢复/松手全程把**形象**夹在屏幕内——形象可以精确贴住
+  屏幕边（窗口的透明边距允许探出屏幕，看不见也不挡点击），不会滑出去；
+  底部留出任务栏高度。
 - 气泡走 BubbleQueue 排队，事件不会被后来的消息立刻冲掉。
 """
 from __future__ import annotations
@@ -24,6 +25,7 @@ BASE_PET_H = 236                 # 鲸鱼娘基础显示高度（成长阶段 sc
 PET_BOTTOM_PAD = 10
 SNAP_DIST = 22                   # 拖拽松手后离屏幕边缘多近算贴边
 TASKBAR_MARGIN = 40              # 位置限制时屏幕底部留出的任务栏高度
+ART_BOX_FALLBACK = (48, 138, 232, 374)   # 渲染前的形象估算包围盒（相对窗口）
 RUA_TICKS = 10                   # rua.gif 播一圈占用的渲染帧数（150ms/帧）
 
 MENU_TOP = [
@@ -86,6 +88,7 @@ class PetWindow(tk.Tk):
         self.mirrored = False                  # 贴左边时镜像（面向屏幕中央）
         self._drag_from = None
         self._moved = False
+        self._art_box_rel = None               # 形象像素包围盒（render 时更新）
         self.canvas.bind("<Button-1>", self._on_press)
         self.canvas.bind("<B1-Motion>", self._on_motion)
         self.canvas.bind("<ButtonRelease-1>", self._on_release)
@@ -314,11 +317,20 @@ class PetWindow(tk.Tk):
 
     # ------------------------------------------------------------ 贴边吸附
 
+    def _art_box(self) -> tuple[int, int, int, int]:
+        """形象相对窗口的像素包围盒 (l, t, r, b)；渲染前用估算值。"""
+        return self._art_box_rel or ART_BOX_FALLBACK
+
     def _clamp_pos(self, x: int, y: int) -> tuple[int, int]:
-        """位置限制：把窗口坐标夹回屏幕内（拖到边缘就停在边缘）。"""
+        """位置限制：按「形象看得见」的范围夹取。
+
+        形象可以精确贴住屏幕边；窗口的透明边距允许探出屏幕外
+        （不可见也不挡点击），但形象本身永远留在屏幕里。
+        """
+        left, _top, right, bottom = self._art_box()
         sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
-        x = min(max(0, int(x)), max(0, sw - W))
-        y = min(max(0, int(y)), max(0, sh - H - TASKBAR_MARGIN))
+        x = min(max(-left, int(x)), max(-left, sw - right))
+        y = min(max(0, int(y)), max(0, sh - TASKBAR_MARGIN - bottom))
         return x, y
 
     def place_at(self, x: int, y: int) -> None:
@@ -326,18 +338,26 @@ class PetWindow(tk.Tk):
         nx, ny = self._clamp_pos(x, y)
         self.geometry(f"+{nx}+{ny}")
 
+    def _nudge_into_art_bounds(self) -> None:
+        """形象范围变化（成长/姿态切换）后，位置越界就轻轻挪回。"""
+        x, y = self.winfo_x(), self.winfo_y()
+        nx, ny = self._clamp_pos(x, y)
+        if (nx, ny) != (x, y):
+            self.geometry(f"+{nx}+{ny}")
+
     def _snap_to_edge(self) -> None:
         x, y = self._clamp_pos(self.winfo_x(), self.winfo_y())
         if not self.snap_enabled:
             self.mirrored = False
             self.geometry(f"+{x}+{y}")     # 关掉吸附也一样出不去的
             return
+        left, _top, right, _bottom = self._art_box()
         sw = self.winfo_screenwidth()
         edge = None
-        if x <= SNAP_DIST:
-            x, edge = 0, "left"
-        elif x + W >= sw - SNAP_DIST:
-            x, edge = sw - W, "right"
+        if x + left <= SNAP_DIST:
+            x, edge = -left, "left"
+        elif x + right >= sw - SNAP_DIST:
+            x, edge = sw - right, "right"
         self.geometry(f"+{x}+{y}")
         self.mirrored = edge == "left"
 
@@ -393,6 +413,16 @@ class PetWindow(tk.Tk):
                 img = frames[idx]
 
         c.create_image(cx, H - PET_BOTTOM_PAD + bob, image=img, anchor="s")
+        # 记录形象的实际像素范围（相对窗口），位置限制按它计算：
+        # 形象可以贴住屏幕边，窗口的透明边距允许出屏
+        try:
+            iw, ih = int(img.width()), int(img.height())
+        except Exception:
+            iw, ih = int(pet_h * 0.8), int(pet_h)
+        art_bottom = H - PET_BOTTOM_PAD + bob
+        self._art_box_rel = (cx - iw // 2, art_bottom - ih,
+                             cx - iw // 2 + iw, art_bottom)
+        self._nudge_into_art_bounds()
 
         if expr == "sleepy":
             drift = (frame % 40) / 3
