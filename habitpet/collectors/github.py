@@ -434,7 +434,8 @@ class GitHubPoller:
         return "连接 GitHub 账号"
 
     def status_lines(self) -> list[str]:
-        """状态气泡里的 GitHub 段（独立于 state.status_lines）。"""
+        """状态气泡里的 GitHub 段。只出紧凑一行：窗口只有 384px 高，
+        长内容会把底部（积分等）顶出可视区；最近推送等细节由点开摘要承载。"""
         if not self.enabled():
             return ["🐙 GitHub：已关闭（config.json → github.enabled）"]
         last = self._last or {}
@@ -442,18 +443,13 @@ class GitHubPoller:
             return ["🐙 GitHub：还没连接（右键菜单 → 连接 GitHub 账号）"]
         st = last.get("status")
         if st in ("ok", "baseline"):
-            bits = [f"🐙 GitHub @{last.get('login') or '?'}"]
+            bits = [f"🐙 @{last.get('login') or '?'}"]
             today = last.get("today_pushes")
             if isinstance(today, int):
-                bits.append(f"今日推送 {today} 个 commit")
+                bits.append(f"今日推送 {today}")
             if last.get("fed"):
                 bits.append(f"云端投喂 +{last['fed']}")
-            lines = [" · ".join(bits)]
-            if last.get("recent"):
-                lines.append("最近推送：" + "、".join(list(last["recent"])[:3]))
-            if last.get("note"):
-                lines.append(last["note"])
-            return lines
+            return [" · ".join(bits)]
         return [f"🐙 GitHub：{last.get('note') or '连接异常'}"]
 
     def drain(self) -> list[tuple]:

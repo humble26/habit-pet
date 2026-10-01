@@ -373,9 +373,9 @@ class TestPollerThreadAndViews(unittest.TestCase):
                    "fed": 2, "recent": ["a/b", "c/d"], "note": ""}
         self.assertIn("@humble26", p.menu_label())
         lines = p.status_lines()
+        self.assertEqual(len(lines), 1, "状态气泡里只留紧凑一行，防底部溢出")
         self.assertIn("今日推送 7", lines[0])
         self.assertIn("云端投喂 +2", lines[0])
-        self.assertIn("最近推送", lines[1])
         p._last = {"status": "err", "note": "网络请求失败"}
         self.assertIn("连接异常", p.menu_label())
         self.assertIn("网络请求失败", p.status_lines()[0])
@@ -464,10 +464,10 @@ class TestStateIntegration(unittest.TestCase):
 
     def test_status_line_shows_github(self):
         st = self._state()
-        self.assertFalse(any("GitHub" in ln for ln in st.status_lines(
+        self.assertFalse(any("云端投喂" in ln for ln in st.status_lines(
             dt.datetime.now())))
         st.connect_github("humble26")
-        self.assertTrue(any("@humble26" in ln for ln in st.status_lines(
+        self.assertTrue(any("云端投喂" in ln for ln in st.status_lines(
             dt.datetime.now())))
 
 

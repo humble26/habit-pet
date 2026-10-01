@@ -379,11 +379,9 @@ class PetState:
             f"寿命   {self._bar(self.lifespan_max)} {self.lifespan_max:.0f}",
             f"连续活跃 {self.active_streak} 天（最高 {self.best_streak}）· "
             f"成长值 {growth.growth_points(self)}",
-            f"累计 commit 喂食 {self.total_commits} 次",
+            f"累计 commit 喂食 {self.total_commits} 次"
+            + (f" · 云端投喂 {self.gh_remote_commits}" if self.gh_login else ""),
         ]
-        if self.gh_login:
-            lines.append(f"🐙 GitHub @{self.gh_login} · 云端累计投喂 "
-                         f"{self.gh_remote_commits} 个 commit")
         if self.focus:
             left = self.focus.remaining_minutes()
             paused = "（已暂停）" if self.focus.paused else ""

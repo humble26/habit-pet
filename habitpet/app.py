@@ -233,9 +233,11 @@ class HabitPetApp:
 
     def _show_status(self) -> None:
         lines = self.state.status_lines(dt.datetime.now())
+        # 顺序=优先级：窗口只有 384px 高，内容超长时底部（积分）先被裁，
+        # GitHub 行紧随核心状态，保证可见
+        lines += self.github.status_lines()
         lines += self.balance.status_lines()
         lines += self.credits.status_lines()
-        lines += self.github.status_lines()
         self.window.show_bubble("\n".join(lines), secs=11)
 
     def _show_achievements(self) -> None:
