@@ -23,6 +23,7 @@ DEFAULT_POLL_SECONDS = 300
 MIN_POLL_SECONDS = 60            # 也覆盖 GitHub 的 X-Poll-Interval 下限
 BASELINE_WINDOW_HOURS = 24
 BASELINE_MAX_COMMITS = 40
+MAX_COMPARES_PER_POLL = 12       # 单轮最多补算多少次提交数（防极端批量）
 _UA = "habit-pet/0.6 (desktop pet; +https://github.com/humble26/habit-pet)"
 
 
@@ -101,7 +102,13 @@ def _parse_time(value) -> Optional[dt.datetime]:
 def parse_push_events(events: list[dict]) -> list[dict]:
     """从 /users/{u}/events 响应里抽 PushEvent（保持新→旧顺序）。
 
-    每项：{"id", "repo"("owner/name"), "commits"(distinct_size 兜底链), "at"}。
+    每项：{"id", "repo"("owner/name"), "commits", "at", "push_id",
+    "before", "head"}。
+
+    注意：GitHub 事件接口对 PushEvent 返回的是**精简 payload**
+    （只有 push_id/ref/head/before），没有 size/distinct_size/commits，
+    此时 commits 为 None，由轮询器用 before…head 对比接口补算；
+    旧式完整 payload 仍走 distinct_size → size → commits 数组 兜底链。
     """
     out: list[dict] = []
     for e in events or []:
@@ -112,13 +119,17 @@ def parse_push_events(events: list[dict]) -> list[dict]:
         if not isinstance(commits, int):
             commits = payload.get("size")
         if not isinstance(commits, int):
-            commits = len(payload.get("commits") or [])
+            arr = payload.get("commits")
+            commits = len(arr) if isinstance(arr, list) else None
         repo = ((e.get("repo") or {}).get("name") or "")
         out.append({
             "id": str(e.get("id") or ""),
             "repo": str(repo),
-            "commits": max(0, int(commits or 0)),
+            "commits": max(0, int(commits)) if isinstance(commits, int) else None,
             "at": _parse_time(e.get("created_at")),
+            "push_id": payload.get("push_id"),
+            "before": str(payload.get("before") or ""),
+            "head": str(payload.get("head") or ""),
         })
     return out
 
@@ -217,6 +228,26 @@ class GitHubClient:
             return {"status": "err", "note": f"找不到用户 {login}"}
         return {"status": "err", "note": f"HTTP {code}"}
 
+    def compare_commits(self, repo: str, before: str, head: str) -> Optional[int]:
+        """before…head 之间的提交数。
+
+        事件接口的精简 payload 不给 size/distinct_size，用官方 compare
+        接口补算（实测 total_commits 与推送实际条数一致）。
+        """
+        try:
+            resp = self._sess().get(
+                f"{API_ROOT}/repos/{repo}/compare/{before}...{head}",
+                headers=self._headers(self.token()), timeout=15)
+        except Exception as e:
+            self.log(f"[github] compare 请求失败：{e!r}")
+            return None
+        if resp.status_code != 200:
+            return None
+        try:
+            return int((resp.json() or {}).get("total_commits"))
+        except (TypeError, ValueError):
+            return None
+
 
 # ---------------------------------------------------------------- 轮询器
 
@@ -234,6 +265,7 @@ class GitHubPoller:
         self._login_cache = ""
         self._etag = ""
         self._poll_floor = 0
+        self._count_cache: dict = {}     # push_id → 提交数（compare 补算缓存）
         self._last: dict = {}
         self._running = False
         self._last_poll = 0.0
@@ -316,6 +348,32 @@ class GitHubPoller:
 
     # ------------------------------------------------------------ 取数
 
+    def _count_of(self, p: dict, budget: list[int]) -> int:
+        """补齐单个事件的提交数（事件接口精简 payload 时走 compare 补算）。
+
+        结果按 push_id 缓存在进程内，同一事件多轮出现不重复请求；
+        无法确定时按 0 计（宁少喂不双喂）。
+        """
+        if isinstance(p.get("commits"), int):
+            return p["commits"]
+        head = str(p.get("head") or "")
+        before = str(p.get("before") or "")
+        # 全零 head=分支删除、全零/缺失 before=首推分支，都无法 compare
+        if not head or not head.strip("0") or not before or not before.strip("0"):
+            return 0
+        key = str(p.get("push_id") or f"{p['repo']}:{head}")
+        if key in self._count_cache:
+            return self._count_cache[key]
+        if budget[0] <= 0:
+            return 0
+        budget[0] -= 1
+        n = self.client.compare_commits(p["repo"], before, head)
+        n = max(0, int(n)) if isinstance(n, int) else 0
+        if len(self._count_cache) > 500:      # 防无界增长
+            self._count_cache.clear()
+        self._count_cache[key] = n
+        return n
+
     def _fresh_remote(self, remote: list[dict]) -> list[dict]:
         """新基线：24h 内、远程仓库、上限 40 个 commit 的推送。"""
         since = dt.datetime.now(dt.timezone.utc) - dt.timedelta(
@@ -367,6 +425,10 @@ class GitHubPoller:
         if r.get("deg"):
             mode = "anon"
         pushes = parse_push_events(r.get("events") or [])
+        budget = [MAX_COMPARES_PER_POLL]
+        for p in pushes:                     # 精简 payload → compare 补算提交数
+            if p.get("commits") is None:
+                p["commits"] = self._count_of(p, budget)
         local = self.local_names()
         remote = [p for p in pushes if p["repo"].lower() not in local]
 

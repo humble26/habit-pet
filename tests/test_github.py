@@ -148,9 +148,13 @@ class TestParsePushEvents(unittest.TestCase):
         # 退回 commits 数组长度
         self.assertEqual(gh.parse_push_events(
             [{**base, "payload": {"commits": [1, 2, 3]}}])[0]["commits"], 3)
-        # 全缺 → 0（如分支删除）
-        self.assertEqual(gh.parse_push_events(
-            [{**base, "payload": {}}])[0]["commits"], 0)
+        # 全缺（GitHub 事件接口的精简 payload）→ None，交给 compare 补算
+        reduced = gh.parse_push_events(
+            [{**base, "payload": {"push_id": 9, "before": "a" * 40,
+                                  "head": "b" * 40}}])[0]
+        self.assertIsNone(reduced["commits"])
+        self.assertEqual(reduced["before"], "a" * 40)
+        self.assertEqual(reduced["head"], "b" * 40)
 
     def test_time_parse(self):
         out = gh.parse_push_events([ev("t", "a/b", 1, utc_now())])
@@ -346,6 +350,71 @@ class TestFetch(unittest.TestCase):
         p.client._session = sess
         r = p._fetch("")
         self.assertEqual(r["status"], "err")
+
+
+def reduced_ev(eid: str, repo: str, before: str, head: str,
+               when: dt.datetime | None = None, push_id: int = 123) -> dict:
+    """GitHub 事件接口的真实形态：PushEvent 精简 payload（无 size/commits）。"""
+    return {"id": eid, "type": "PushEvent", "repo": {"name": repo},
+            "payload": {"repository_id": 1, "push_id": push_id,
+                        "ref": "refs/heads/main", "head": head,
+                        "before": before},
+            "created_at": _iso(when or today_noon_utc())}
+
+
+class TestReducedPayloadCompare(unittest.TestCase):
+    """真实事件接口不给 size：提交数必须走 compare 补算（2026-10 实测）。"""
+
+    def test_resolved_via_compare(self):
+        events = [reduced_ev("id1", "me/remote", "a" * 40, "b" * 40)]
+        sess = FakeSession(gets=[FakeResp(events, 200, {}),
+                                 FakeResp({"total_commits": 3}, 200, {})])
+        p = poller_with([], login="me", token="t0")
+        p.client._session = sess
+        r = p._fetch("")
+        self.assertEqual(r["fed"], 3)
+        self.assertEqual(r["fed_repos"], {"me/remote": 3})
+        self.assertEqual(r["today_pushes"], 3)
+        compare_url = [c[1] for c in sess.calls if "/compare/" in c[1]]
+        self.assertEqual(compare_url,
+                         [f"https://api.github.com/repos/me/remote/"
+                          f"compare/{'a' * 40}...{'b' * 40}"])
+
+    def test_count_cached_across_polls(self):
+        events = [reduced_ev("id1", "me/remote", "a" * 40, "b" * 40)]
+        sess = FakeSession(gets=[FakeResp(events, 200, {}),
+                                 FakeResp({"total_commits": 3}, 200, {}),
+                                 FakeResp(events, 200, {})])
+        p = poller_with([], login="me", token="t0")
+        p.client._session = sess
+        first = p._fetch("")
+        p._last = first
+        second = p._fetch(first["cursor"])     # 游标=最新 → 无新事件
+        self.assertEqual(second["fed"], 0)
+        self.assertEqual(second["today_pushes"], 3)
+        self.assertEqual(len([c for c in sess.calls if "/compare/" in c[1]]), 1,
+                         "同一 push 不允许重复 compare")
+
+    def test_branch_delete_and_first_push_skip_compare(self):
+        events = [reduced_ev("id1", "me/remote", "a" * 40, "0" * 40),      # 删分支
+                  reduced_ev("id2", "me/other", "0" * 40, "c" * 40,
+                             push_id=124)]                                 # 首推分支
+        sess = FakeSession(gets=[FakeResp(events, 200, {})])
+        p = poller_with([], login="me", token="t0")
+        p.client._session = sess
+        r = p._fetch("")                        # 队列只有事件响应，调了 compare 会报错
+        self.assertEqual(r["fed"], 0)
+        self.assertEqual(r["today_pushes"], 0)
+
+    def test_compare_failure_counts_zero(self):
+        events = [reduced_ev("id1", "me/remote", "a" * 40, "b" * 40)]
+        sess = FakeSession(gets=[FakeResp(events, 200, {}),
+                                 FakeResp({}, 404, {})])
+        p = poller_with([], login="me", token="t0")
+        p.client._session = sess
+        r = p._fetch("")
+        self.assertEqual(r["status"], "baseline")
+        self.assertEqual(r["fed"], 0)
 
 
 # ------------------------------------------------------------ 轮询与视图 --
