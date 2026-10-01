@@ -147,7 +147,7 @@ class HabitPetApp:
         if x < 0 or y < 0:
             self.window.place_default()
         else:
-            self.window.geometry(f"+{x}+{y}")
+            self.window.place_at(x, y)     # 存档位置也夹在屏幕内
 
     # ------------------------------------------------------------ 循环
 

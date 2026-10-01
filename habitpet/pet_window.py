@@ -4,6 +4,8 @@
   按成长阶段缩放；透明走色键（whale_art.KEY_HEX）。
 - 交互并入 DSH 小鲸鱼挂件的玩法：按压 Q 弹 + 音效、松开回弹、
   拖拽贴边吸附（贴左时水平镜像）、点按触发 rua 动图。
+- 位置限制：拖动/恢复/松手全程把窗口夹在屏幕内（到边就停，鲸鱼娘不会
+  被拖出屏幕；底部留出任务栏高度）。
 - 气泡走 BubbleQueue 排队，事件不会被后来的消息立刻冲掉。
 """
 from __future__ import annotations
@@ -21,6 +23,7 @@ W, H = 280, 384
 BASE_PET_H = 236                 # 鲸鱼娘基础显示高度（成长阶段 scale=1.0）
 PET_BOTTOM_PAD = 10
 SNAP_DIST = 22                   # 拖拽松手后离屏幕边缘多近算贴边
+TASKBAR_MARGIN = 40              # 位置限制时屏幕底部留出的任务栏高度
 RUA_TICKS = 10                   # rua.gif 播一圈占用的渲染帧数（150ms/帧）
 
 MENU_TOP = [
@@ -187,7 +190,8 @@ class PetWindow(tk.Tk):
             if not self._moved:
                 self._squash_to(1.0, ms=60)   # 进入拖拽，收起按压态
             self._moved = True
-            self.geometry(f"+{wx + dx}+{wy + dy}")
+            nx, ny = self._clamp_pos(wx + dx, wy + dy)
+            self.geometry(f"+{nx}+{ny}")
 
     def _on_release(self, e):
         if self._drag_from and not self._moved:
@@ -310,18 +314,30 @@ class PetWindow(tk.Tk):
 
     # ------------------------------------------------------------ 贴边吸附
 
+    def _clamp_pos(self, x: int, y: int) -> tuple[int, int]:
+        """位置限制：把窗口坐标夹回屏幕内（拖到边缘就停在边缘）。"""
+        sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
+        x = min(max(0, int(x)), max(0, sw - W))
+        y = min(max(0, int(y)), max(0, sh - H - TASKBAR_MARGIN))
+        return x, y
+
+    def place_at(self, x: int, y: int) -> None:
+        """放到指定坐标（自动限制在屏幕内；恢复存档位置用）。"""
+        nx, ny = self._clamp_pos(x, y)
+        self.geometry(f"+{nx}+{ny}")
+
     def _snap_to_edge(self) -> None:
-        x, y = self.winfo_x(), self.winfo_y()
+        x, y = self._clamp_pos(self.winfo_x(), self.winfo_y())
         if not self.snap_enabled:
             self.mirrored = False
+            self.geometry(f"+{x}+{y}")     # 关掉吸附也一样出不去的
             return
-        sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
+        sw = self.winfo_screenwidth()
         edge = None
         if x <= SNAP_DIST:
             x, edge = 0, "left"
         elif x + W >= sw - SNAP_DIST:
             x, edge = sw - W, "right"
-        y = min(max(0, y), max(0, sh - H - 40))
         self.geometry(f"+{x}+{y}")
         self.mirrored = edge == "left"
 
