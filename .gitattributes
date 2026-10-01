@@ -1,0 +1,3 @@
+# Windows cmd 解析 .bat 时行尾必须是 CRLF：
+# LF + UTF-8 中文内容会被 cmd 误解析（对本仓库是 v0.3 起就踩过的坑）。
+*.bat text eol=crlf
