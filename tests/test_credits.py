@@ -15,6 +15,7 @@ from pathlib import Path
 from unittest import mock
 
 from habitpet import credits as cr
+from habitpet import wbgrab as wg
 
 
 # ------------------------------------------------------------ 测试替身 --
@@ -43,7 +44,8 @@ class FakeSession:
             raise self.exc
         if not self.posts:
             raise AssertionError(f"unexpected POST {url}")
-        return FakeResp(self.posts.pop(0))
+        item = self.posts.pop(0)
+        return item if isinstance(item, FakeResp) else FakeResp(item)
 
     def get(self, url, headers=None, timeout=None):
         self.calls.append(("get", url, dict(headers or {})))
@@ -51,7 +53,8 @@ class FakeSession:
             raise self.exc
         if not self.gets:
             raise AssertionError(f"unexpected GET {url}")
-        return FakeResp(self.gets.pop(0))
+        item = self.gets.pop(0)
+        return item if isinstance(item, FakeResp) else FakeResp(item)
 
 
 def wait_for(pred, timeout: float = 3.0) -> bool:
@@ -311,6 +314,46 @@ class TestQoderHelpers(unittest.TestCase):
         self.assertIsNone(cr.qoder_parse_credits({}))
         self.assertIsNone(cr.qoder_parse_credits({"a": 1, "ok": True}))
 
+    def test_parse_usage_structured(self):
+        # 实测形状：v2/me/usage（qoderUsage.userQuota）
+        parsed = cr.qoder_parse_usage({
+            "displayMode": "qoder",
+            "qoderUsage": {
+                "userType": "teams", "isQuotaExceeded": False,
+                "expiresAt": 1792771200000,
+                "userQuota": {"total": 3000, "used": 929, "remaining": 2071,
+                              "percentage": 0.31, "unit": "credits"},
+                "orgResourcePackage": {"remaining": 0, "available": False},
+            }})
+        self.assertIsNotNone(parsed)
+        summary, short, lines = parsed
+        self.assertEqual(short, "剩 2071")
+        self.assertTrue(any("已用 929/3000" in l and "31%" in l for l in lines))
+        self.assertTrue(any("有效期" in l for l in lines))
+        self.assertFalse(any("团队资源包" in l for l in lines))
+        self.assertIsNone(cr.qoder_parse_usage({"qoderUsage": {}}))
+
+    def test_parse_usage_org_package_and_exceeded(self):
+        _, short, lines = cr.qoder_parse_usage({
+            "qoderUsage": {
+                "isQuotaExceeded": True,
+                "userQuota": {"total": 100, "used": 100, "remaining": 0,
+                              "unit": "credits"},
+                "orgResourcePackage": {"remaining": 50, "available": True},
+            }})
+        self.assertEqual(short, "额度用尽")
+        self.assertTrue(any("团队资源包剩余 50" in l for l in lines))
+
+    def test_parse_summary_fallback(self):
+        parsed = cr.qoder_parse_summary(
+            {"totalCredits": 419.39978071639996, "peakCredits": 334.42,
+             "peakDate": "2026-09-24", "unit": "credits"})
+        self.assertIsNotNone(parsed)
+        _, short, lines = parsed
+        self.assertIn("累计 419.4", short)
+        self.assertTrue(any("峰值 334.42/天" in l for l in lines))
+        self.assertIsNone(cr.qoder_parse_summary({}))
+
     def test_query_no_userdata_is_off(self):
         with tempfile.TemporaryDirectory() as d:
             with mock.patch.dict(os.environ, {"APPDATA": d}):
@@ -347,9 +390,39 @@ class TestQoderFullChain(unittest.TestCase):
                 res = p.query()
         self.assertEqual(res["status"], "warn")
         self.assertIn("登录态无效", res["summary"])
-        url = sess.calls[0][1]
-        self.assertTrue(url.startswith(cr.QODER_API + "/sash/api/v1/me/"))
+        self.assertEqual(sess.calls[0][1],
+                         cr.QODER_API + "/sash/api/v2/me/usage")
         self.assertTrue(sess.calls[0][2]["Authorization"].startswith("Bearer "))
+
+    def test_real_endpoint_structured_with_summary(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            self._make_userdata(root, {
+                "token": "T" * 40,
+                "expiresAt": "2099-01-01T00:00:00Z",
+                "user": {"name": "测试用户"}})
+            usage = {"displayMode": "qoder",
+                     "qoderUsage": {
+                         "isQuotaExceeded": False,
+                         "userQuota": {"total": 3000, "used": 929,
+                                       "remaining": 2071,
+                                       "percentage": 0.31,
+                                       "unit": "credits"}}}
+            summary = {"totalCredits": 419.4, "peakCredits": 334.42,
+                       "peakDate": "2026-09-24"}
+            sess = FakeSession(gets=[usage, summary])
+            with mock.patch.dict(os.environ, {"APPDATA": str(root)}):
+                p = cr.QoderProvider(session=sess)
+                res = p.query()
+        self.assertEqual(res["status"], "ok")
+        self.assertEqual(res["short"], "剩 2071")
+        self.assertTrue(any("累计消耗" in l for l in res["lines"]))
+        self.assertTrue(any("测试用户" in l for l in res["lines"]))
+        self.assertEqual(p.found_endpoint, "/sash/api/v2/me/usage")
+        self.assertEqual(sess.calls[0][1],
+                         cr.QODER_API + "/sash/api/v2/me/usage")
+        self.assertEqual(sess.calls[1][1],
+                         cr.QODER_API + cr.QODER_CREDITS_SUMMARY)
 
     def test_logged_in_but_endpoint_unknown(self):
         with tempfile.TemporaryDirectory() as d:
@@ -453,6 +526,143 @@ class TestWorkBuddy(unittest.TestCase):
             p = cr.WorkBuddyProvider(home=Path(d) / "missing",
                                      session=FakeSession())
             self.assertEqual(p.query()["status"], "off")
+
+
+class TestWorkBuddyServer(unittest.TestCase):
+    """有 token 的服务端模式：解析 + 失效降级（全离线，不碰网络）。"""
+
+    SUMMARY_JSON = {
+        "code": 0, "msg": "OK",
+        "data": {
+            "Packages": [
+                {"PackageCode": "p1", "CycleTotalCapacity": "3100",
+                 "CycleRemainCapacity": "2742.00000054",
+                 "CycleUsedCapacity": "357.99999946",
+                 "CapacityUnit": "credits"},
+                {"CycleTotalCapacity": "500", "CycleRemainCapacity": "500",
+                 "CycleUsedCapacity": "0"},
+                {"CycleTotalCapacity": "1106", "CycleRemainCapacity": "1106",
+                 "CycleUsedCapacity": "0"},
+            ],
+            "SubscriptionPackageName": "体验版", "IsPaidUser": False,
+        }}
+
+    CHECKIN_JSON = {
+        "code": 0, "msg": "OK",
+        "data": {"active": True, "today_checked_in": True, "streak_days": 2,
+                 "today_credit": 100, "total_credits": 200}}
+
+    def test_parse_summary_sums_packages(self):
+        got = cr.wb_parse_summary(self.SUMMARY_JSON)
+        self.assertEqual(got["remain"], 4348.0)
+        self.assertEqual(got["used"], 358.0)
+        self.assertEqual(got["total"], 4706.0)
+        self.assertEqual(got["packages"], 3)
+        self.assertEqual(got["plan"], "体验版")
+        self.assertFalse(got["paid"])
+        self.assertIsNone(cr.wb_parse_summary({"code": 0, "data": {}}))
+        self.assertIsNone(cr.wb_parse_summary(None))
+
+    def test_provider_server_mode(self):
+        with tempfile.TemporaryDirectory() as d:
+            sess = FakeSession(posts=[self.CHECKIN_JSON, self.SUMMARY_JSON])
+            p = cr.WorkBuddyProvider(token="tok-1", home=Path(d),
+                                     session=sess)
+            res = p.query()
+        self.assertEqual(res["status"], "ok")
+        self.assertEqual(res["short"], "剩 4348 已签")
+        self.assertIn("体验版", res["summary"])
+        self.assertIn("连续 2 天", res["summary"])
+        self.assertEqual(sess.calls[0][1], cr.EP_WB_CHECKIN)
+        self.assertEqual(sess.calls[1][1], cr.EP_WB_SUMMARY)
+        self.assertTrue(sess.calls[1][2]["Authorization"]
+                        .startswith("Bearer tok-1"))
+        self.assertNotIn("tok-1", json.dumps(res))     # token 不进结果
+        self.assertNotIn("本地口径", res["summary"])    # 不叠加本地台账
+
+    def test_provider_token_expired_falls_back_with_note(self):
+        with tempfile.TemporaryDirectory() as d:
+            home = Path(d)
+            (home / "logs").mkdir()
+            (home / "logs" / "main.log").write_text(json.dumps(
+                {"timestamp": dt.datetime.now().strftime(
+                    "%Y-%m-%dT%H:%M:%S.000Z"),
+                 "message": ["[Checkin] fetchCheckinStatus success",
+                             {"today_checked_in": True, "streak_days": 2,
+                              "today_credit": 100}]}), encoding="utf-8")
+            sess = FakeSession(posts=[FakeResp({"code": 401}, status=401),
+                                      FakeResp({"code": 401}, status=401)])
+            p = cr.WorkBuddyProvider(token="tok-1", home=home, session=sess)
+            res = p.query()
+        self.assertEqual(res["status"], "ok")          # 本地降级仍有数据
+        self.assertIn("已签", res["summary"])
+        self.assertTrue(any("token 已失效" in l for l in res["lines"]))
+        self.assertTrue(any("wbgrab" in l for l in res["lines"]))
+
+    def test_provider_no_token_hints_grab_tool(self):
+        with tempfile.TemporaryDirectory() as d:
+            home = Path(d)
+            (home / "logs").mkdir()
+            (home / "logs" / "main.log").write_text(json.dumps(
+                {"timestamp": dt.datetime.now().strftime(
+                    "%Y-%m-%dT%H:%M:%S.000Z"),
+                 "message": ["[Checkin] fetchCheckinStatus success",
+                             {"today_checked_in": True, "streak_days": 2,
+                              "today_credit": 100}]}), encoding="utf-8")
+            p = cr.WorkBuddyProvider(home=home, session=FakeSession())
+            res = p.query()
+        self.assertEqual(res["status"], "ok")
+        self.assertTrue(any("wbgrab" in l for l in res["lines"]))
+
+
+# ------------------------------------------------------------- wbgrab --
+
+class TestWbGrab(unittest.TestCase):
+    def test_mask_never_shows_full_token(self):
+        tok = "e" * 200
+        m = wg.mask_token(tok)
+        self.assertNotIn(tok, m)
+        self.assertIn("200 字符", m)
+
+    def test_write_config_merges_existing(self):
+        with tempfile.TemporaryDirectory() as d:
+            cfg = Path(d)
+            (cfg / "config.json").write_text(json.dumps(
+                {"version": 1, "repos": ["x"],
+                 "credits": {"enabled": True, "poll_seconds": 900}}),
+                encoding="utf-8")
+            p = wg.write_config(cfg, "tok-123")
+            data = json.loads(p.read_text(encoding="utf-8"))
+        self.assertEqual(data["credits"]["workbuddy_token"], "tok-123")
+        self.assertEqual(data["credits"]["poll_seconds"], 900)  # 原有字段保留
+        self.assertEqual(data["repos"], ["x"])
+        self.assertEqual(data["version"], 1)
+
+    def test_write_config_creates_when_missing(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = wg.write_config(Path(d), "tok-9")
+            data = json.loads(p.read_text(encoding="utf-8"))
+        self.assertEqual(data["credits"]["workbuddy_token"], "tok-9")
+
+    def test_ws_client_frame_encode(self):
+        # _frame 不触碰实例状态，以 None 作 self 直接验证线格式
+        for payload in (b"hi", b"x" * 125, b"y" * 300, b"z" * 70000):
+            frame = wg._CdpWs._frame(None, 0x1, payload)
+            self.assertEqual(frame[0], 0x81)
+            self.assertTrue(frame[1] & 0x80)           # 客户端帧必须带 mask
+            n = frame[1] & 0x7F
+            off = 2
+            if n == 126:
+                n = int.from_bytes(frame[2:4], "big")
+                off = 4
+            elif n == 127:
+                n = int.from_bytes(frame[2:10], "big")
+                off = 10
+            self.assertEqual(n, len(payload))
+            mask = frame[off:off + 4]
+            body = frame[off + 4:]
+            self.assertEqual(
+                bytes(b ^ mask[i % 4] for i, b in enumerate(body)), payload)
 
 
 # ---------------------------------------------------------- Tracker --

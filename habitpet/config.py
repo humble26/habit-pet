@@ -52,7 +52,7 @@ DEFAULT_CONFIG: dict = {
         "poll_seconds": 1800,       # 自动轮询间隔（秒），下限 300
         "providers": {              # 单独开关某一家：{"workbuddy": {"enabled": false}}
         },
-        "workbuddy_token": "",      # 可选：手填后 WorkBuddy 走服务端实时状态
+        "workbuddy_token": "",      # 可选：python -m habitpet.wbgrab --write 抓取后走服务端实时额度
     },
     # GitHub 云端连接：远程投喂 + 动态展示 + 专属成就
     # 登录态全自动复用：token（手填）→ 本机 gh CLI（gh auth login 过的）→ 匿名公开数据

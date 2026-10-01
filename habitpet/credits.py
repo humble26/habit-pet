@@ -9,14 +9,17 @@
 - Qoder CN：读 Electron userData 的 Chromium OSCrypt 存储——
   Local State 的 os_crypt.encrypted_key（DPAPI 解出主密钥）→
   auth.v1.dat（v10 格式；实测其 16B 尾巴不是标准 GCM tag，按 CTR 解出后
-  用 JSON 结构自检代替校验）→ 调 openapi.qoder.com.cn /sash/api/v1/me/*
-  候选端点，命中一个后缓存复用（自愈）。截至 0.4.3，额度端点尚未识别到，
-  此时退回"已登录（账号）"的降级提示；其余查询不受影响。
-- WorkBuddy：服务端接口（workbuddy.cn /v2/billing/meter/*）需要登录态，
-  本地没有可自动读取的凭据；降级为本地台账：签到状态取自客户端日志
-  （~/.workbuddy/logs/main*.log 的 [Checkin] 记录），今日消耗取自
-  workbuddy.db 的 session_usage.credit_json。config.json 里手填
-  credits.workbuddy_token 后可走服务端实时状态。
+  用 JSON 结构自检代替校验）→ 调 openapi.qoder.com.cn。实测 0.4.3 的
+  真实额度端点为 /sash/api/v2/me/usage（qoderUsage.userQuota 的
+  total/used/remaining），另配 /sash/api/v1/ai-conversations/credits-summary
+  （累计消耗与峰值）作补充与兜底；命中端点会缓存复用（自愈）。
+- WorkBuddy：优先走服务端实时状态——token 取自 config.json 的
+  credits.workbuddy_token（用 `python -m habitpet.wbgrab` 一键抓取/更新，
+  详见该模块）。有 token 时调 workbuddy.cn /billing/meter/get-user-resource-summary
+  （各资源包的 CycleTotal/Remain/UsedCapacity 汇总）与
+  /v2/billing/meter/checkin-activity-status；token 失效或无 token 时降级为
+  本地台账：签到状态取自客户端日志（~/.workbuddy/logs/main*.log 的
+  [Checkin] 记录），今日消耗取自 workbuddy.db 的 session_usage.credit_json。
 
 任何一步失败都降级为一行提示，不影响桌宠其他功能；网络查询在后台线程，
 主循环只消费队列（与 BalanceTracker 同一套路）。
@@ -514,16 +517,15 @@ class TraeProvider:
 # ══════════════════════════════════════════════════════════ Qoder Provider ══
 
 QODER_API = "https://openapi.qoder.com.cn"
+# 实测（Qoder CN 0.4.3）真实端点在前；后几条是早期误报候选保留的兜底，
+# 找不到真端点时可自愈换用（命中结果会缓存复用）。
+QODER_CREDITS_SUMMARY = "/sash/api/v1/ai-conversations/credits-summary"
 QODER_PATHS = [
+    "/sash/api/v2/me/usage",
+    QODER_CREDITS_SUMMARY,
     "/sash/api/v1/me/usage",
-    "/sash/api/v1/me/usage/summary",
-    "/sash/api/v1/me/plan",
     "/sash/api/v1/me/credits",
     "/sash/api/v1/me/quota",
-    "/sash/api/v1/me/balance",
-    "/sash/api/v1/me/entitlements",
-    "/sash/api/v1/me/subscription",
-    "/sash/api/v1/me/account",
 ]
 QODER_VERSION = "0.4.3"
 
@@ -661,6 +663,76 @@ def qoder_parse_credits(j: dict) -> tuple[str, str, list[str]] | None:
     return summary, short, lines
 
 
+def qoder_parse_usage(j: dict) -> tuple[str, str, list[str]] | None:
+    """v2/me/usage 的结构化解析（实测：qoderUsage.userQuota 下
+    total/used/remaining，单位为 credits；orgResourcePackage 为团队资源包）。"""
+    qu = (j or {}).get("qoderUsage")
+    if not isinstance(qu, dict):
+        return None
+    q = qu.get("userQuota") if isinstance(qu.get("userQuota"), dict) else {}
+    total, used, remain = _f(q.get("total")), _f(q.get("used")), _f(q.get("remaining"))
+    if remain is None and total is not None and used is not None:
+        remain = round(total - used, 4)
+    if remain is None:
+        return None
+    unit = str(q.get("unit") or "credits")
+    short = f"剩 {_fmt_num(remain)}"
+    lines = []
+    if total is not None and used is not None:
+        pct = _f(q.get("percentage"))
+        tail = f"，{_fmt_num(pct * 100)}%" if pct is not None else ""
+        lines.append(f"剩余 {_fmt_num(remain)} {unit}"
+                     f"（已用 {_fmt_num(used)}/{_fmt_num(total)}{tail}）")
+    else:
+        lines.append(f"剩余 {_fmt_num(remain)} {unit}")
+    org = qu.get("orgResourcePackage")
+    if isinstance(org, dict) and org.get("available") is True:
+        o_r = _f(org.get("remaining"))
+        if o_r:
+            lines.append(f"团队资源包剩余 {_fmt_num(o_r)} {unit}")
+    if qu.get("isQuotaExceeded") is True:
+        short = "额度用尽"
+        lines.append("⚠ 额度已用尽")
+    exp = _f(qu.get("expiresAt"))
+    if exp:
+        try:
+            day = dt.datetime.fromtimestamp(exp / 1000.0).date().isoformat()
+            lines.append(f"套餐有效期至 {day}")
+        except (OverflowError, OSError, ValueError):
+            pass
+    return short, short, lines
+
+
+def qoder_parse_summary(j: dict) -> tuple[str, str, list[str]] | None:
+    """credits-summary 解析（实测：totalCredits / peakCredits / peakDate）。
+
+    只有累计消耗、没有剩余额度，作补充展示或真端点失效时的兜底。
+    """
+    total = _f((j or {}).get("totalCredits"))
+    if total is None:
+        return None
+    peak, peak_date = _f(j.get("peakCredits")), str(j.get("peakDate") or "")
+    short = f"累计 {_fmt_num(total)}"
+    line = f"AI 累计消耗 {_fmt_num(total)} credits"
+    if peak:
+        line += f"（峰值 {_fmt_num(peak)}/天"
+        line += f"，{peak_date}）" if peak_date else "）"
+    return short, short, [line]
+
+
+def _qoder_parse_by_path(path: str, j: dict) -> tuple[str, str, list[str]] | None:
+    """按端点选结构化解析器，识别不了再退回通用数字提取。"""
+    if isinstance(j.get("qoderUsage"), dict):
+        got = qoder_parse_usage(j)
+        if got:
+            return got
+    if "credits-summary" in path:
+        got = qoder_parse_summary(j)
+        if got:
+            return got
+    return qoder_parse_credits(j)
+
+
 class QoderProvider:
     def __init__(self, session=None, hint_endpoint: str = "") -> None:
         self.key, self.label, self.short = "qoder_cn", "Qoder CN", "Qoder"
@@ -753,10 +825,18 @@ class QoderProvider:
                     continue
                 if meta == 404 or str(j.get("errorCode", "")).lower() == "notfound":
                     continue                  # 该路由不存在，换下一个候选
-                parsed = qoder_parse_credits(j)
+                parsed = _qoder_parse_by_path(path, j)
                 if parsed:
                     self.found_endpoint = path
                     summary, short, lines = parsed
+                    if path == "/sash/api/v2/me/usage":
+                        # 真额度端点：顺带取累计消耗/峰值做补充行（失败不影响主结果）
+                        j2, _m2 = self._get(QODER_API + QODER_CREDITS_SUMMARY,
+                                            headers)
+                        p2 = qoder_parse_summary(j2) if isinstance(j2, dict) \
+                            else None
+                        if p2:
+                            lines.extend(p2[2])
                     if who:
                         lines.append(f"账号：{who}")
                     lines.append(f"数据端点：{path}")
@@ -784,6 +864,7 @@ class QoderProvider:
 # ═══════════════════════════════════════════════════════ WorkBuddy Provider ══
 
 WB_API = "https://www.workbuddy.cn"
+EP_WB_SUMMARY = WB_API + "/billing/meter/get-user-resource-summary"
 EP_WB_CHECKIN = WB_API + "/v2/billing/meter/checkin-activity-status"
 
 
@@ -871,8 +952,71 @@ def _wb_row_day(updated_at) -> dt.date | None:
         return None
 
 
+def wb_parse_summary(j: dict) -> dict | None:
+    """服务端资源汇总解析（实测：data.Packages[].CycleTotal/Remain/UsedCapacity，
+    CapacityUnit=credits）。返回 {remain, used, total, packages, plan, paid}。"""
+    data = (j or {}).get("data")
+    if not isinstance(data, dict):
+        return None
+    pkgs = data.get("Packages")
+    if not isinstance(pkgs, list) or not pkgs:
+        return None
+    total = used = remain = 0.0
+    n = 0
+    for p in pkgs:
+        if not isinstance(p, dict):
+            continue
+        t = _f(p.get("CycleTotalCapacity"))
+        u = _f(p.get("CycleUsedCapacity"))
+        r = _f(p.get("CycleRemainCapacity"))
+        if r is None and (t is not None or u is not None):
+            r = (t or 0.0) - (u or 0.0)
+        if t is None and u is None and r is None:
+            continue
+        total += t or 0.0
+        used += u or 0.0
+        remain += r or 0.0
+        n += 1
+    if not n:
+        return None
+    return {"remain": round(remain, 2), "used": round(used, 2),
+            "total": round(total, 2), "packages": n,
+            "plan": str(data.get("SubscriptionPackageName") or ""),
+            "paid": bool(data.get("IsPaidUser"))}
+
+
+def _wb_checkin_seg(ck: dict, from_log: bool = False) -> str:
+    checked = bool(ck.get("today_checked_in"))
+    streak = ck.get("streak_days")
+    credit = ck.get("today_credit")
+    total = ck.get("total_credits")
+    if checked:
+        seg = f"今日已签 +{_fmt_num(credit)}" if credit is not None \
+            else "今日已签到"
+        extra = []
+        if streak:
+            extra.append(f"连续 {_fmt_num(streak)} 天")
+        if total is not None:
+            extra.append(f"累计 {_fmt_num(total)}")
+        if extra:
+            seg += f"（{'，'.join(extra)}）"
+    else:
+        seg = "今日还未签到"
+        if streak:
+            seg += f"（连续 {_fmt_num(streak)} 天）"
+    if from_log:
+        at = str(ck.get("_log_at", ""))[:10]
+        if at and at != dt.date.today().isoformat():
+            seg = f"最近一次（{at}）：" + seg.replace("今日", "")
+    return seg
+
+
 class WorkBuddyProvider:
-    """服务端接口需要登录态且本地读不到；主要用本地台账降级。"""
+    """有 token 走服务端实时额度；无 token 或登录态失效时用本地台账降级。
+
+    token 来自 config.json 的 credits.workbuddy_token（python -m habitpet.wbgrab
+    可一键抓取），只进内存、绝不写日志。
+    """
 
     def __init__(self, token: str = "", home: Path | None = None,
                  session=None) -> None:
@@ -882,20 +1026,24 @@ class WorkBuddyProvider:
         self._session = session
 
     def _post(self, url: str, headers: dict, body: dict):
+        """返回 (json|None, status|错误摘要)。"""
         sess = self._session
         if sess is None:
             try:
                 import requests
             except ImportError:
-                return None
+                return None, "no-requests"
             sess = requests
         try:
             resp = sess.post(url, headers=headers,
                              data=json.dumps(body).encode("utf-8"),
                              timeout=HTTP_TIMEOUT)
-            return resp.json()
-        except Exception:
-            return None
+            try:
+                return resp.json(), resp.status_code
+            except ValueError:
+                return None, resp.status_code
+        except Exception as e:
+            return None, repr(e)
 
     def query(self) -> dict:
         try:
@@ -907,44 +1055,63 @@ class WorkBuddyProvider:
         if not self._home.exists():
             return _result("off", "未找到 WorkBuddy 数据目录")
         shorts, details = [], []
-        checkin = None
+        parsed = None
+        ck = None
+        auth_fail = False
+
         if self._token:
-            j = self._post(EP_WB_CHECKIN, {
-                "Authorization": "Bearer " + self._token,
-                "Content-Type": "application/json",
-                "User-Agent": "WorkBuddy/1.0"}, {})
-            if isinstance(j, dict) and ("today_checked_in" in j
-                                        or (j.get("data") or {}).get("today_checked_in")
-                                        is not None):
-                checkin = j.get("data") if isinstance(j.get("data"), dict) else j
-        if checkin is None:
+            hdr = {"Authorization": "Bearer " + self._token,
+                   "Content-Type": "application/json",
+                   "Accept": "application/json",
+                   "Accept-Language": "zh-CN",
+                   "User-Agent": "WorkBuddy/1.0"}
+            ck_j, cmeta = self._post(EP_WB_CHECKIN, hdr, {})
+            sm_j, smeta = self._post(EP_WB_SUMMARY, hdr, {})
+            if isinstance(sm_j, dict):
+                parsed = wb_parse_summary(sm_j)
+            if isinstance(ck_j, dict):
+                ck = ck_j.get("data") if isinstance(ck_j.get("data"), dict) \
+                    else ck_j
+            ck_ok = isinstance(ck, dict) and "today_checked_in" in ck
+            if not parsed and not ck_ok:
+                auth_fail = cmeta in (401, 403) or smeta in (401, 403)
+
+        if parsed:
+            shorts.append(f"剩 {_fmt_num(parsed['remain'])}")
+            seg = f"剩余 {_fmt_num(parsed['remain'])} credits"
+            tags = [t for t in (parsed.get("plan"),
+                                f"{parsed['packages']} 个资源包") if t]
+            if tags:
+                seg += f"（{' · '.join(tags)}）"
+            seg += (f"，已用 {_fmt_num(parsed['used'])}/"
+                    f"{_fmt_num(parsed['total'])}")
+            details.append(seg)
+        if isinstance(ck, dict) and "today_checked_in" in ck:
+            shorts.append("已签" if ck.get("today_checked_in") else "未签")
+            details.append("签到：" + _wb_checkin_seg(ck))
+
+        if not shorts:
+            # 本地降级：日志签到 + 台账消耗
             checkin = wb_latest_checkin(self._home)
             if checkin is not None:
                 checkin = dict(checkin)
                 checkin["_from"] = "log"
-        if checkin is not None:
-            checked = bool(checkin.get("today_checked_in"))
-            streak = checkin.get("streak_days")
-            credit = checkin.get("today_credit")
-            if checked:
-                shorts.append("已签")
-                seg = f"今日已签 +{_fmt_num(credit)}" if credit is not None \
-                    else "今日已签到"
-                if streak:
-                    seg += f"（连续 {streak} 天）"
-            else:
-                shorts.append("未签")
-                seg = "今日还未签到"
-            if checkin.get("_from") == "log":
-                at = str(checkin.get("_log_at", ""))[:10]
-                if at and at != dt.date.today().isoformat():
-                    seg = f"最近一次（{at}）：" + seg.replace("今日", "")
-            details.append(seg)
-        usage = wb_today_usage(self._home / "workbuddy.db", dt.date.today())
-        if usage is not None:
-            total, n = usage
-            shorts.append(f"耗{_fmt_num(total)}")
-            details.append(f"本机今日消耗 ≈ {_fmt_num(total)} 分（{n} 个会话）")
+                shorts.append("已签" if checkin.get("today_checked_in")
+                              else "未签")
+                details.append(_wb_checkin_seg(checkin, from_log=True))
+            usage = wb_today_usage(self._home / "workbuddy.db",
+                                   dt.date.today())
+            if usage is not None:
+                total, n = usage
+                shorts.append(f"耗{_fmt_num(total)}")
+                details.append(f"本机今日消耗 ≈ {_fmt_num(total)} 分"
+                               f"（{n} 个会话）")
+            if self._token and auth_fail:
+                details.append("token 已失效：重开 WorkBuddy 后跑 "
+                               "python -m habitpet.wbgrab --write 更新")
+            elif not self._token:
+                details.append("本地口径（日志/台账）；python -m "
+                               "habitpet.wbgrab 可解锁服务端实时额度")
         if not shorts:
             return _result("warn", "暂无可读数据（打开一次 WorkBuddy 再看）")
         return _result("ok", " · ".join(details), " ".join(shorts), details)
@@ -1128,7 +1295,17 @@ def _main(argv: list[str]) -> int:
     except Exception:
         pass
     keys = [a for a in argv[1:] if not a.startswith("-")]
-    conf = {"enabled": True}
+    # 默认复用 ~/.habitpet/config.json 的 credits 段（含 workbuddy_token）；
+    # 也可显式传 provider key 只查其中几家。
+    conf: dict = {}
+    try:
+        raw = json.loads((Path.home() / ".habitpet" / "config.json")
+                         .read_text(encoding="utf-8"))
+        if isinstance(raw, dict) and isinstance(raw.get("credits"), dict):
+            conf = dict(raw["credits"])
+    except (OSError, ValueError):
+        pass
+    conf["enabled"] = True
     if keys:
         conf["providers"] = {
             k: {"enabled": k in keys}

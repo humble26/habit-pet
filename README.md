@@ -9,6 +9,9 @@
 > **v0.7 是一次体验优化轮**：气泡升级为独立圆角卡片（智能避让 + 点击穿透）、
 > 右键菜单收纳「设置」子菜单、状态面板对齐重排、渲染提速（增量平移），
 > 并修掉一批云端投喂的可靠性问题（断网重试 / 补喂可分次 / 离家期间不消费事件）。
+> **v0.8 打通了 Qoder 与 WorkBuddy 的真实额度接口**：Qoder 直读官方配额端点
+> （剩余/已用/有效期），WorkBuddy 新增 `python -m habitpet.wbgrab` 一键抓取
+> 登录态后走服务端实时额度（资源包汇总 + 签到），两家都保留本地降级。
 > 一只养在桌面上的鲸鱼娘：**饱食度由你的 git commit 喂养、久坐掉血、熬夜掉寿命上限**，
 > LLM 负责针对你的行为说风凉话。
 
@@ -71,28 +74,38 @@ v0.6 起多了一个**可整体关闭的云端数据源**——GitHub（见「Gi
 |---|---|---|---|
 | Trae CN | `%APPDATA%\Trae CN\...\storage.json` 的自加密凭据（本地解密） | api.trae.cn 额度 + 签到接口 | 剩余 / 已用 / 今日签到 |
 | TraeWork CN | 同上（TRAE SOLO CN 客户端） | 同上 | 同上 |
-| WorkBuddy | 客户端日志的最近签到记录 + `workbuddy.db` 本地台账 | 服务端接口需登录态，暂不可得 | 今日已签 / 连续天数 / 本机今日消耗 |
-| Qoder CN | Electron OSCrypt 存储（DPAPI + AES 本地解密） | openapi.qoder.com.cn `/sash/api/v1/me/*` 候选端点 | 已登录（额度端点识别中） |
+| WorkBuddy | 登录态：`python -m habitpet.wbgrab` 抓取（实测约 30 天有效）；无 token 时退回本地台账 | workbuddy.cn `/billing/meter/get-user-resource-summary` + 签到接口 | 剩余资源包 / 已用 / 套餐名 / 今日签到 |
+| Qoder CN | Electron OSCrypt 存储（DPAPI + AES 本地解密） | openapi.qoder.com.cn `/sash/api/v2/me/usage`（实测）+ 累计消耗 | 剩余 / 已用 / 套餐有效期 / 累计消耗 |
 
 已知边界（说在前面，防止期待落空）：
 
 - **Trae 系**读的是客户端最后一次写盘的登录态；太久没打开客户端会提示
   "登录态已过期：打开一次客户端刷新"，打开一次即恢复。
-- **WorkBuddy** 服务端接口带登录态校验且本地读不到该凭据，因此展示**本地台账**
-  （签到状态 + 本机今日消耗）。想接服务端实时状态可把凭据填进
-  `credits.workbuddy_token`（实验性）。
-- **Qoder CN** 的登录凭据能自动解密、服务端也认可（会显示账号与有效期），
-  但其"额度"接口路径截至客户端 0.4.3 尚未识别；程序会用候选表持续探测，
-  命中后自动缓存复用（自愈），在此之前显示"已登录 · 额度接口未识别"。
+- **WorkBuddy** 的登录态以「进程内存 + 加密落盘」保存，磁盘上没有可读副本；
+  用 `python -m habitpet.wbgrab` 连本机调试端口，从客户端自己的请求里取走
+  Bearer 并校验（工具内不打印全文；`--write` 才会写进你自己的 config.json）。
+  没有 token / token 过期时自动退回本地台账（日志签到 + 本机今日消耗），
+  只会多一行提示、绝不影响其它功能。
+- **Qoder CN** 走的已是实测真端点：`/sash/api/v2/me/usage` 给出
+  剩余 / 已用 / 套餐有效期，另配累计消耗与峰值；凭据自动解密、无需任何配置。
 - 单独关某家：`credits.providers.<key>.enabled = false`；整体关闭：
   `credits.enabled = false`。查询都在后台线程，任何一家失败只降级为一行提示，
   绝不影响桌宠主循环。
 
-命令行排查（跑一次打印四家结果，不写任何文件）：
+命令行排查（跑一次打印四家结果；会复用 `~/.habitpet/config.json` 的配置，
+不写任何文件）：
 
 ```bash
 python -m habitpet.credits            # 四家各查一次
 python -m habitpet.credits qoder_cn   # 只查其中一家
+```
+
+WorkBuddy 走服务端额度需要先抓一次登录态（token 只写进你自己的配置文件）：
+
+```bash
+python -m habitpet.wbgrab             # 抓取 + 校验剩余额度（不写配置）
+python -m habitpet.wbgrab --write     # 顺手写入 ~/.habitpet/config.json
+# 连不上调试端口时：完全退出 WorkBuddy 后加 --launch（自动带端口启动）
 ```
 
 ## GitHub 云端连接（v0.6）
@@ -234,7 +247,8 @@ habit-pet/
 │   ├── whale_art.py      # 形象渲染：PNG 缩放 / 镜像 / 状态调色 / 自定义角色
 │   ├── sound.py          # 音效：wav 走 winsound、mp3 走 winmm MCI，失败静默
 │   ├── balance.py        # 小鲸鱼记账：余额直查 + 今日已用观测 + 预警
-│   ├── credits.py        # 剩余积分：Trae 凭据解密 / Qoder OSCrypt / WorkBuddy 台账（四家聚合）
+│   ├── credits.py        # 剩余积分：Trae 凭据解密 / Qoder OSCrypt 真端点 / WorkBuddy 服务端+台账（四家聚合）
+│   ├── wbgrab.py         # WorkBuddy 登录态抓取（本机 CDP，纯标准库；python -m habitpet.wbgrab）
 │   ├── collectors/
 │   │   ├── gitfeed.py    # git 提交轮询（rev-list --count，空仓库不误判）
 │   │   ├── github.py     # GitHub 云端连接（gh CLI 复用 / 事件去重 / 远程投喂）
@@ -254,9 +268,10 @@ habit-pet/
 ## 测试与冒烟
 
 ```bash
-python -m unittest discover -s tests -t .   # 175 tests OK
+python -m unittest discover -s tests -t .   # 237 tests OK
 python -m habitpet --smoke                   # 启动 4 秒自动退出，打印状态
 python -m habitpet.credits                   # 单跑一次四家积分查询
+python -m habitpet.wbgrab --write            # 抓取 WorkBuddy 登录态并写入配置
 python -m habitpet.collectors.github         # 单跑一次 GitHub 连接（只读）
 ```
 
@@ -272,8 +287,10 @@ python -m habitpet.collectors.github         # 单跑一次 GitHub 连接（只�
   互动和产出驱动，MVP 阶段够用。
 - **积分走"全自动读本机登录态"而不是让用户贴 token**（v0.5）：桌宠常驻本机，
   读自己账号在本机的登录态与"记账读 DSH 凭据"是同一条思路；四家互相隔离，
-  任何一家读不到只会降级成一行提示——其中 Qoder 的额度端点尚未识别，
-  就诚实地显示"已登录"，绝不伪造数字。
+  任何一家读不到只会降级成一行提示，绝不伪造数字。v0.8 里唯一的例外是
+  WorkBuddy：它的登录态只在进程内存里，磁盘上全是加密件，于是用一次性
+  `wbgrab` 从客户端自己的请求里取走 Bearer（用户显式运行、显式 `--write`），
+  在那之前一直用本地台账顶着。
 - **GitHub 投喂按 origin 排重**（v0.6）：本机的 commit 已由 GitPoller 计粮，
   云端事件只补"别的机器 / 没克隆的仓库"那一份，两个数据源不重叠、不双计；
   首次连接只回溯 24 小时，避免把历史旧账一次性喂进来把数值打爆。
@@ -302,6 +319,7 @@ python -m habitpet.collectors.github         # 单跑一次 GitHub 连接（只�
 - [x] v0.5：剩余积分聚合（Trae CN / TraeWork CN / WorkBuddy / Qoder CN，全自动读取 + 逐家降级）
 - [x] v0.6：GitHub 云端连接（远程投喂 + 动态展示 + 云端成就，自动复用 gh CLI 登录）
 - [x] v0.7：体验优化轮（气泡卡 / 菜单瘦身 / 状态对齐 / 增量渲染 / 云端投喂可靠性修复）
+- [x] v0.8：Qoder 真额度端点（v2/me/usage）+ WorkBuddy 服务端额度（wbgrab 抓取，本地降级保留）
 - [ ] M4：独立美术壳 / 多数据源 / 直播弹幕联动（接 02 号弹幕引擎）/ 多宠物牧场
 
 ## 隐私红线
@@ -314,6 +332,9 @@ python -m habitpet.collectors.github         # 单跑一次 GitHub 连接（只�
 剩余积分查询沿用同一条红线：**只读**本机客户端的登录态，凭据只在内存里用于
 当次请求（不写日志、不落盘），请求只发往对应厂商自己的接口去取你自己的数字，
 结果缓存（`~/.habitpet/credits.json`）里只有数字与文案、没有任何凭据。
+唯一例外是 WorkBuddy：其登录态磁盘上只有加密件，需你显式运行
+`python -m habitpet.wbgrab --write` 后，token 才会存在**你自己的**
+`config.json` 里（工具输出永远打码；不想保留就清空该字段）。
 
 GitHub 连接同样如此：**只读你自己的推送事件**（仓库名 / commit 数 / 时间），
 不看任何代码内容；token 自动复用本机 gh CLI 或匿名访问，只在内存里流转
