@@ -5,6 +5,8 @@
 - token 只在内存里流转，不进日志、不落磁盘（gh CLI 的凭据留在 gh 自己那里）
 - 「远程投喂」只补本地 GitPoller 管不到的仓库：本地配置的仓库按 origin 归一化后排除，
   同一个 push 不会被本地扫描和云端事件喂两遍
+- 事件级去重：喂过的 push 事件 ID 由 UI 层记进 state（gh_fed_ids）并回传过滤，
+  基线/增量轮询/历史补喂任何路径重叠都不会重喂同一个事件
 - 首次连接 / 游标滚出事件列表时按「新基线」处理：只认 24 小时内远程仓库的推送，
   上限 40 个 commit，不会一上来回溯几百条历史把宠物撑死
 """
@@ -24,6 +26,7 @@ MIN_POLL_SECONDS = 60            # 也覆盖 GitHub 的 X-Poll-Interval 下限
 BASELINE_WINDOW_HOURS = 24
 BASELINE_MAX_COMMITS = 40
 MAX_COMPARES_PER_POLL = 12       # 单轮最多补算多少次提交数（防极端批量）
+BACKFILL_MAX_PAGES = 3           # 历史补喂翻页上限（GitHub 事件接口本身也限页）
 _UA = "habit-pet/0.6 (desktop pet; +https://github.com/humble26/habit-pet)"
 
 
@@ -196,15 +199,17 @@ class GitHubClient:
                 return None
         return None
 
-    def fetch_events(self, login: str, token: str, etag: str = "") -> dict:
+    def fetch_events(self, login: str, token: str, etag: str = "",
+                     page: int = 1) -> dict:
         """返回 {status: ok/none/auth/rate/err, events?, etag?, poll_floor?, note?}。"""
         headers = self._headers(token)
         if etag:
             headers["If-None-Match"] = etag
+        url = f"{API_ROOT}/users/{login}/events?per_page=100"
+        if page > 1:
+            url += f"&page={page}"
         try:
-            resp = self._sess().get(
-                f"{API_ROOT}/users/{login}/events?per_page=100",
-                headers=headers, timeout=15)
+            resp = self._sess().get(url, headers=headers, timeout=15)
         except Exception as e:
             return {"status": "err", "note": f"网络请求失败：{str(e)[:80]}"}
         code = resp.status_code
@@ -287,8 +292,8 @@ class GitHubPoller:
 
     # ------------------------------------------------------------ 轮询
 
-    def maybe_poll(self, cursor: str = "", force: bool = False,
-                   now: Optional[float] = None) -> bool:
+    def maybe_poll(self, cursor: str = "", fed_ids: Optional[set] = None,
+                   force: bool = False, now: Optional[float] = None) -> bool:
         if not self.enabled() or self._running:
             return False
         t = now if now is not None else dt.datetime.now().timestamp()
@@ -299,18 +304,94 @@ class GitHubPoller:
             return False
         self._running = True
         self._last_poll = t
-        threading.Thread(target=self._work, args=(str(cursor or ""),),
+        threading.Thread(target=self._work,
+                         args=(str(cursor or ""), set(fed_ids or ())),
                          daemon=True).start()
         return True
 
-    def _work(self, cursor: str) -> None:
+    def _work(self, cursor: str, fed_ids: set) -> None:
         try:
-            payload = self._fetch(cursor)
+            payload = self._fetch(cursor, fed_ids)
         except Exception as e:               # 线程里兜住一切，绝不上抛
             payload = {"status": "err", "note": f"查询出错：{e!r}"[:120]}
         self._last = payload
         self._queue.put(("github_done", payload))
         self._running = False
+
+    # ------------------------------------------------------------ 历史补喂
+
+    def start_backfill(self, cursor: str = "",
+                       fed_ids: Optional[set] = None) -> bool:
+        """一次性把接口能翻到的历史推送全补喂（只喂没消费/没喂过的部分）。"""
+        if not self.enabled() or self._running:
+            return False
+        self._running = True
+        self._last_poll = dt.datetime.now().timestamp()
+        threading.Thread(target=self._backfill_work,
+                         args=(str(cursor or ""), set(fed_ids or ())),
+                         daemon=True).start()
+        return True
+
+    def _backfill_work(self, cursor: str, fed_ids: set) -> None:
+        try:
+            payload = self._fetch_backfill(cursor, fed_ids)
+        except Exception as e:
+            payload = {"status": "err", "backfill": True,
+                       "note": f"补喂出错：{e!r}"[:120]}
+        self._last = payload
+        self._queue.put(("github_done", payload))
+        self._running = False
+
+    def _fetch_backfill(self, cursor: str, fed_ids: Optional[set] = None) -> dict:
+        fed_ids = set(fed_ids or ())
+        login, token = self._resolve()
+        if not login:
+            return {"status": "err", "backfill": True, "mode": "anon",
+                    "note": "没有可用的 GitHub 登录：先「连接 GitHub 账号」一次"}
+        r = self._fetch_events_retry(login, token, etag="")   # 补喂不吃 304
+        if r.get("status") != "ok":
+            return {"status": "err", "backfill": True, "login": login,
+                    "note": r.get("note") or "历史拉取失败"}
+        mode = "anon" if r.get("deg") else ("token" if token else "anon")
+        events = list(r.get("events") or [])
+        for page in range(2, BACKFILL_MAX_PAGES + 1):
+            if len(events) < 100:            # 上一页没装满 → 没有更多
+                break
+            r2 = self.client.fetch_events(login, token, "", page=page)
+            if r2.get("status") != "ok" or not (r2.get("events") or []):
+                break
+            events.extend(r2["events"])
+        all_pushes = parse_push_events(events)
+        newest = next((p["id"] for p in all_pushes if p["id"]), "")
+        pushes = all_pushes
+        if cursor:                           # 只补游标之后（更旧）未消费的部分
+            idx = next((i for i, p in enumerate(pushes)
+                        if p["id"] == cursor), None)
+            if idx is not None:
+                pushes = pushes[idx + 1:]
+        local = self.local_names()
+        # 事件级去重：喂过的事件绝不重喂（防基线/轮询与补喂的窗口重叠）
+        remote = [p for p in pushes
+                  if p["repo"].lower() not in local and p["id"] not in fed_ids]
+        budget = [len(remote) + 10]          # 一次性动作，放开单轮上限
+        fed, fed_repos, fed_ids_out = 0, {}, []
+        for p in remote:
+            p["commits"] = self._count_of(p, budget)
+            if p["commits"] > 0 and self.conf.get("feed", True):
+                fed += p["commits"]
+                fed_repos[p["repo"]] = fed_repos.get(p["repo"], 0) + p["commits"]
+                if p["id"]:
+                    fed_ids_out.append(p["id"])
+        times = [p["at"] for p in remote if p["at"]]
+        span_days = (dt.datetime.now(dt.timezone.utc)
+                     - min(times)).days if times else 0
+        return {"status": "ok", "backfill": True, "login": login, "mode": mode,
+                "cursor": cursor or newest,
+                "fed": fed, "fed_repos": fed_repos, "fed_ids": fed_ids_out,
+                "events": len(events), "pushes": len(remote),
+                "span_days": span_days, "recent": [],
+                "note": "GitHub 活动接口最多回溯约 90 天",
+                "at": dt.datetime.now().strftime("%m-%d %H:%M")}
 
     # ------------------------------------------------------------ 连接解析
 
@@ -331,15 +412,20 @@ class GitHubPoller:
             self._login_cache = login
         return login, token
 
-    def _fetch_events_retry(self, login: str, token: str) -> dict:
-        """401 时刷新 token 重试一次，再不行降匿名（只看公开事件）。"""
-        r = self.client.fetch_events(login, token, self._etag)
+    def _fetch_events_retry(self, login: str, token: str,
+                            etag: Optional[str] = None) -> dict:
+        """401 时刷新 token 重试一次，再不行降匿名（只看公开事件）。
+
+        etag=None 用轮询器缓存的 ETag；补喂历史传 "" 强制走完整响应。
+        """
+        et = self._etag if etag is None else etag
+        r = self.client.fetch_events(login, token, et)
         if r.get("status") == "auth" and token:
             token2 = self.client.token(refresh=True)
             if token2 and token2 != token:
-                r = self.client.fetch_events(login, token2, self._etag)
+                r = self.client.fetch_events(login, token2, et)
             if r.get("status") == "auth":
-                r = self.client.fetch_events(login, "", self._etag)
+                r = self.client.fetch_events(login, "", et)
                 if r.get("status") == "ok":
                     r["deg"] = "匿名模式：只看得见公开推送"
                 else:
@@ -388,7 +474,8 @@ class GitHubPoller:
             total += p["commits"]
         return picked
 
-    def _fetch(self, cursor: str) -> dict:
+    def _fetch(self, cursor: str, fed_ids: Optional[set] = None) -> dict:
+        fed_ids = set(fed_ids or ())
         login, token = self._resolve()
         mode = "token" if token else "anon"
         if not login:
@@ -410,7 +497,7 @@ class GitHubPoller:
             prev = self._last or {}
             return {"status": "ok", "login": login,
                     "mode": prev.get("mode", mode), "cursor": cursor,
-                    "fed": 0, "fed_repos": {},
+                    "fed": 0, "fed_repos": {}, "fed_ids": [],
                     "today_pushes": prev.get("today_pushes"),
                     "recent": prev.get("recent") or [],
                     "rate_left": prev.get("rate_left"),
@@ -447,17 +534,20 @@ class GitHubPoller:
         else:
             new_pushes = [p for p in pushes[:idx]
                           if p["repo"].lower() not in local]
+        new_pushes = [p for p in new_pushes if p["id"] not in fed_ids]
 
         newest = next((p["id"] for p in pushes if p["id"]), "") or cursor
 
         fed_repos: dict[str, int] = {}
-        fed = 0
+        fed, fed_ids_out = 0, []
         if self.conf.get("feed", True):
             for p in new_pushes:
                 if p["commits"] <= 0:
                     continue
                 fed += p["commits"]
                 fed_repos[p["repo"]] = fed_repos.get(p["repo"], 0) + p["commits"]
+                if p["id"]:
+                    fed_ids_out.append(p["id"])
         note = ""
         if baseline and not cursor:
             note = "首次连接 · 只回溯 24 小时内的远程推送"
@@ -477,7 +567,7 @@ class GitHubPoller:
         return {
             "status": "baseline" if baseline else "ok",
             "login": login, "mode": mode, "cursor": newest,
-            "fed": fed, "fed_repos": fed_repos,
+            "fed": fed, "fed_repos": fed_repos, "fed_ids": fed_ids_out,
             "today_pushes": today_pushes, "recent": recent,
             "rate_left": r.get("rate_left"), "note": note,
             "at": dt.datetime.now().strftime("%m-%d %H:%M"),
@@ -540,6 +630,6 @@ if __name__ == "__main__":              # python -m habitpet.collectors.github
     if len(sys.argv) > 1:
         conf["username"] = sys.argv[1]
     poller = GitHubPoller(conf, repos=[], log=lambda m: print(m))
-    result = poller._fetch(cursor="")
+    result = poller._fetch("", set())
     safe = {k: v for k, v in result.items() if k != "token"}
     print(json.dumps(safe, ensure_ascii=False, indent=2, default=str))

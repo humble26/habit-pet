@@ -127,6 +127,8 @@ class PetState:
         self.gh_last_event_id = ""       # 已消费到的事件游标（远程投喂去重）
         self.gh_remote_commits = 0       # 云端累计投喂的 commit 数
         self.gh_repos_seen: list[str] = []   # 云端投喂过的仓库（激励多仓库）
+        self.gh_backfilled = False       # 历史推送是否已一次性补喂过
+        self.gh_fed_ids: list[str] = []  # 已喂过的事件 ID（事件级去重：基线/轮询/补喂不重喂）
         # 专注模式（会话本身不持久化，重启即取消）
         self.focus: Optional[FocusSession] = None
         self.total_focus_count = 0
@@ -448,6 +450,8 @@ class PetState:
             "gh_last_event_id": self.gh_last_event_id,
             "gh_remote_commits": self.gh_remote_commits,
             "gh_repos_seen": self.gh_repos_seen[-200:],
+            "gh_backfilled": self.gh_backfilled,
+            "gh_fed_ids": self.gh_fed_ids[-500:],
             "today": self.today.to_dict(),
             "history": self.history,
         }
@@ -501,6 +505,12 @@ class PetState:
         st.last_poll = _safe_iso(data.get("last_poll"), None)
         st.gh_login = str(data.get("gh_login", "") or "")
         st.gh_last_event_id = str(data.get("gh_last_event_id", "") or "")
+        st.gh_backfilled = bool(data.get("gh_backfilled", False))
+        try:
+            st.gh_fed_ids = [str(x) for x in
+                             (data.get("gh_fed_ids") or []) if str(x)][-500:]
+        except TypeError:
+            st.gh_fed_ids = []
         try:
             st.gh_repos_seen = [str(x) for x in
                                 (data.get("gh_repos_seen") or [])][-200:]

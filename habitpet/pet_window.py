@@ -117,6 +117,10 @@ class PetWindow(tk.Tk):
         self.menu.add_command(label="连接 GitHub 账号",
                               command=lambda: self._cb("github_click"))
         self._github_idx = self.menu.index("end")
+        # 补喂云端历史推送（一次性；已补喂后标签变 ✓）
+        self.menu.add_command(label="补喂云端历史推送",
+                              command=lambda: self._cb("github_backfill"))
+        self._gh_backfill_idx = self.menu.index("end")
         self.menu.add_command(label="贴边吸附：开",
                               command=lambda: self._cb("snap_toggle"))
         self._snap_idx = self.menu.index("end")
@@ -232,6 +236,10 @@ class PetWindow(tk.Tk):
         if self.callbacks.get("github_label"):
             self.menu.entryconfigure(
                 self._github_idx, label=str(self.callbacks["github_label"]()))
+        if self.callbacks.get("github_backfill_label"):
+            self.menu.entryconfigure(
+                self._gh_backfill_idx,
+                label=str(self.callbacks["github_backfill_label"]()))
         if self.callbacks.get("snap_state"):
             on = bool(self.callbacks["snap_state"]())
             self.menu.entryconfigure(

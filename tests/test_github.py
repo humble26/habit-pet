@@ -225,6 +225,7 @@ class TestFetch(unittest.TestCase):
         self.assertEqual(r["status"], "baseline")
         self.assertEqual(r["fed"], 3)
         self.assertEqual(r["fed_repos"], {"me/remote": 3})
+        self.assertEqual(r["fed_ids"], ["n1"])
         self.assertEqual(r["cursor"], "n1")
         self.assertIn("首次连接", r["note"])
         # today_pushes 统计所有仓库（含本地的推送到 GitHub 的那部分）
@@ -246,6 +247,27 @@ class TestFetch(unittest.TestCase):
         self.assertEqual(r["fed_repos"], {"me/remote": 2})
         self.assertEqual(r["cursor"], "id2")
 
+    def test_baseline_skips_already_fed_ids(self):
+        """时间窗重叠回归：基线刷新时，喂过的事件 ID 不允许重喂。"""
+        events = [ev("n1", "me/remote", 3), ev("n2", "me/remote", 5)]
+        sess = FakeSession(gets=[self._events_resp(events)])
+        p = poller_with([], login="me", token="t0")
+        p.client._session = sess
+        r = p._fetch("", {"n1"})              # n1 已喂过（上次轮询/基线窗口内）
+        self.assertEqual(r["status"], "baseline")
+        self.assertEqual(r["fed"], 5)
+        self.assertEqual(r["fed_ids"], ["n2"])
+
+    def test_cursor_path_skips_already_fed_ids(self):
+        """游标截取与 fed_ids 过滤叠加：双喂窗口内的事件不再重复计入。"""
+        events = [ev("id2", "me/remote", 2), ev("id0", "me/other", 4)]
+        sess = FakeSession(gets=[self._events_resp(events)])
+        p = poller_with([], login="me", token="t0")
+        p.client._session = sess
+        r = p._fetch("id0", {"id2"})          # id2 在游标前，但已喂过
+        self.assertEqual(r["fed"], 0)
+        self.assertEqual(r["fed_ids"], [])
+
     def test_cursor_rolled_off_falls_back_to_baseline(self):
         events = [ev("new", "me/remote", 4)]
         sess = FakeSession(gets=[self._events_resp(events)])
@@ -264,6 +286,7 @@ class TestFetch(unittest.TestCase):
         p.client._session = sess
         r = p._fetch("")
         self.assertEqual(r["fed"], 0)
+        self.assertEqual(r["fed_ids"], [])
         self.assertEqual(r["cursor"], "id9")
         self.assertIn("只展示", r["note"])
 
@@ -417,17 +440,116 @@ class TestReducedPayloadCompare(unittest.TestCase):
         self.assertEqual(r["fed"], 0)
 
 
+class TestBackfill(unittest.TestCase):
+    """历史补喂：翻页、只喂游标之后的旧事件、一次性。"""
+
+    def test_feeds_all_when_no_cursor(self):
+        events = [ev("n1", "me/a", 2), ev("n2", "me/b", 3),
+                  ev("n3", "me/a", 1)]
+        sess = FakeSession(gets=[FakeResp(events, 200, {})])
+        p = poller_with([], login="me", token="t0")
+        p.client._session = sess
+        r = p._fetch_backfill("")
+        self.assertTrue(r["backfill"])
+        self.assertEqual(r["fed"], 6)
+        self.assertEqual(r["fed_repos"], {"me/a": 3, "me/b": 3})
+        self.assertEqual(r["fed_ids"], ["n1", "n2", "n3"])
+        self.assertEqual(r["cursor"], "n1")
+        self.assertEqual(r["pushes"], 3)
+
+    def test_backfill_skips_already_fed_ids(self):
+        """双喂回归：基线已喂过的事件，补喂翻到了也不许再喂。"""
+        events = [ev("n1", "me/a", 2), ev("n2", "me/b", 3),
+                  ev("n3", "me/a", 1), ev("n4", "me/c", 5)]
+        sess = FakeSession(gets=[FakeResp(events, 200, {})])
+        p = poller_with([], login="me", token="t0")
+        p.client._session = sess
+        r = p._fetch_backfill("n2", {"n3"})   # n3 已被基线喂过
+        self.assertEqual(r["fed"], 5)          # 只剩 n4(5)
+        self.assertEqual(r["fed_ids"], ["n4"])
+        self.assertEqual(r["pushes"], 1)
+
+    def test_only_events_older_than_cursor(self):
+        events = [ev("n1", "me/a", 2), ev("n2", "me/b", 3),
+                  ev("n3", "me/a", 1), ev("n4", "me/c", 5)]
+        sess = FakeSession(gets=[FakeResp(events, 200, {})])
+        p = poller_with([], login="me", token="t0")
+        p.client._session = sess
+        r = p._fetch_backfill("n2")           # n1/n2 已消费过
+        self.assertEqual(r["fed"], 6)         # 只剩 n3(1) + n4(5)
+        self.assertEqual(r["fed_repos"], {"me/a": 1, "me/c": 5})
+        self.assertEqual(r["cursor"], "n2")   # 游标不动
+
+    def test_backfill_respects_local_dedupe(self):
+        events = [ev("n1", "me/local", 9), ev("n2", "me/remote", 4)]
+        sess = FakeSession(gets=[FakeResp(events, 200, {})])
+        p = poller_with([], login="me", token="t0")   # _local = {"me/local"}
+        p.client._session = sess
+        r = p._fetch_backfill("")
+        self.assertEqual(r["fed"], 4)
+        self.assertEqual(r["pushes"], 1)
+
+    def test_backfill_feed_disabled(self):
+        events = [ev("n1", "me/a", 2)]
+        sess = FakeSession(gets=[FakeResp(events, 200, {})])
+        p = poller_with([], login="me", token="t0",
+                        conf_extra={"feed": False})
+        p.client._session = sess
+        r = p._fetch_backfill("")
+        self.assertEqual(r["fed"], 0)
+        self.assertTrue(r["backfill"])
+
+    def test_backfill_paginates(self):
+        page1 = [ev(f"p{i}", f"me/r{i % 3}", 1) for i in range(100)]
+        page2 = [ev("q1", "me/x", 2)]
+        sess = FakeSession(gets=[FakeResp(page1, 200, {}),
+                                 FakeResp(page2, 200, {})])
+        p = poller_with([], login="me", token="t0")
+        p.client._session = sess
+        r = p._fetch_backfill("")
+        self.assertEqual(r["events"], 101)
+        self.assertEqual(r["fed"], 102)
+        self.assertEqual(len([c for c in sess.calls if "page=2" in c[1]]), 1)
+
+    def test_start_backfill_thread_and_guards(self):
+        events = [ev("n1", "me/a", 1)]
+        sess = FakeSession(gets=[FakeResp(events, 200, {})])
+        p = poller_with([], login="me", token="t0")
+        p.client._session = sess
+        self.assertTrue(p.start_backfill(""))
+        self.assertTrue(wait_for(lambda: bool(p.drain())))
+        self.assertFalse(p._running)
+        p.conf["enabled"] = False
+        self.assertFalse(p.start_backfill(""))
+
+    def test_backfill_login_missing(self):
+        p = gh.GitHubPoller({"enabled": True}, repos=[],
+                            client=gh.GitHubClient({"enabled": True}),
+                            log=lambda _m: None)
+        with mock.patch.object(gh, "gh_cli_token", return_value=None), \
+             mock.patch.object(gh, "git_config_github_user", return_value=None):
+            r = p._fetch_backfill("")
+        self.assertEqual(r["status"], "err")
+        self.assertTrue(r["backfill"])
+
+
 # ------------------------------------------------------------ 轮询与视图 --
 
 class TestPollerThreadAndViews(unittest.TestCase):
     def test_maybe_poll_thread_and_throttle(self):
         events = [ev("id1", "me/repo", 1)]
-        sess = FakeSession(gets=[FakeResp(events, 200, {})])
+        sess = FakeSession(gets=[FakeResp(events, 200, {}),
+                                 FakeResp(events, 200, {})])
         p = poller_with([], login="me", token="t0")
         p.client._session = sess
         self.assertTrue(p.maybe_poll("", force=True))
         self.assertTrue(wait_for(lambda: bool(p.drain())))
         self.assertFalse(p._running)
+        # fed_ids 透传到取数层：已喂过的事件不再计入
+        self.assertTrue(p.maybe_poll("", {"id1"}, force=True))
+        self.assertTrue(wait_for(lambda: bool(p.drain())))
+        self.assertEqual(p._last.get("fed"), 0)
+        self.assertEqual(p._last.get("fed_ids"), [])
         # 间隔未到 → 不再轮询
         self.assertFalse(p.maybe_poll("id1"))
         # 关闭后直接拒绝
@@ -512,6 +634,8 @@ class TestStateIntegration(unittest.TestCase):
         st = self._state()
         st.connect_github("humble26")
         st.feed(7, remote=True, repos=["a/b"])
+        st.gh_backfilled = True
+        st.gh_fed_ids = ["e1", "e2"]
         with tempfile.TemporaryDirectory() as td:
             path = Path(td) / "state.json"
             st.save(path)
@@ -519,6 +643,8 @@ class TestStateIntegration(unittest.TestCase):
         self.assertEqual(st2.gh_login, "humble26")
         self.assertEqual(st2.gh_remote_commits, 7)
         self.assertEqual(st2.gh_repos_seen, ["a/b"])
+        self.assertTrue(st2.gh_backfilled)
+        self.assertEqual(st2.gh_fed_ids, ["e1", "e2"])
 
     def test_old_save_without_gh_fields(self):
         with tempfile.TemporaryDirectory() as td:
@@ -529,6 +655,7 @@ class TestStateIntegration(unittest.TestCase):
         self.assertEqual(st.gh_login, "")
         self.assertEqual(st.gh_remote_commits, 0)
         self.assertEqual(st.gh_repos_seen, [])
+        self.assertEqual(st.gh_fed_ids, [])
         self.assertEqual(st.today.gh_pushes, 0)
 
     def test_status_line_shows_github(self):
@@ -543,22 +670,27 @@ class TestStateIntegration(unittest.TestCase):
 # ------------------------------------------------------------ app 接线 --
 
 class TestAppDrain(unittest.TestCase):
-    def test_drain_applies_state(self):
+    def _make_app(self, github_enabled=False):
         from habitpet.app import HabitPetApp
         from habitpet.pet_window import PetWindow
         cfgdir = Path(tempfile.mkdtemp(prefix="habitpet_gh_"))
         (cfgdir / "config.json").write_text(json.dumps({
             "repos": [], "llm": {"enabled": False},
             "sound": {"enabled": False}, "balance": {"enabled": False},
-            "credits": {"enabled": False}, "github": {"enabled": False},
+            "credits": {"enabled": False},
+            "github": {"enabled": github_enabled},
         }, ensure_ascii=False), encoding="utf-8")
         w = PetWindow(callbacks={})
         w.withdraw()
-        app = HabitPetApp(w, cfgdir)
+        return HabitPetApp(w, cfgdir), w
+
+    def test_drain_applies_state(self):
+        app, w = self._make_app()
         try:
             app.github._queue.put(("github_done", {
                 "status": "ok", "login": "humble26", "mode": "token",
                 "cursor": "idX", "fed": 3, "fed_repos": {"a/b": 3},
+                "fed_ids": ["id1"],
                 "today_pushes": 8, "recent": ["a/b"], "note": "",
                 "at": "10-01 12:00"}))
             app._drain_github_events()
@@ -566,8 +698,44 @@ class TestAppDrain(unittest.TestCase):
             self.assertEqual(app.state.gh_last_event_id, "idX")
             self.assertEqual(app.state.gh_remote_commits, 3)
             self.assertEqual(app.state.today.gh_pushes, 3)
+            self.assertEqual(app.state.gh_fed_ids, ["id1"])
             self.assertIn("a/b", app.state.gh_repos_seen)
             self.assertIn("gh_connect", app.state.unlocked)
+        finally:
+            w.destroy()
+
+    def test_drain_backfill(self):
+        app, w = self._make_app(github_enabled=True)
+        try:
+            app.github._queue.put(("github_done", {
+                "status": "ok", "backfill": True, "login": "humble26",
+                "cursor": "idNew", "fed": 5, "fed_repos": {"a/b": 5},
+                "fed_ids": ["z1", "z2"],
+                "span_days": 25, "pushes": 10, "events": 87,
+                "recent": [], "note": "", "at": "10-01 16:00"}))
+            app._drain_github_events()
+            self.assertTrue(app.state.gh_backfilled)
+            self.assertEqual(app.state.gh_remote_commits, 5)
+            self.assertEqual(app.state.gh_last_event_id, "idNew")
+            self.assertEqual(app.state.gh_fed_ids, ["z1", "z2"])
+            # 已补喂后手动再点 → 守卫拦下，不会再起线程、不会再投喂
+            app._github_backfill()
+            self.assertFalse(app.github._running)
+            self.assertEqual(app.state.gh_remote_commits, 5)
+        finally:
+            w.destroy()
+
+    def test_record_gh_fed_dedupes_and_caps(self):
+        app, w = self._make_app()
+        try:
+            app._record_gh_fed({"fed_ids": ["a", "a", "b", ""]})
+            self.assertEqual(app.state.gh_fed_ids, ["a", "b"])
+            app.state.gh_fed_ids = [f"x{i}" for i in range(500)]
+            app._record_gh_fed({"fed_ids": ["tail"]})
+            self.assertEqual(len(app.state.gh_fed_ids), 500)
+            self.assertEqual(app.state.gh_fed_ids[-1], "tail")
+            app._record_gh_fed({})            # 无 key 不炸
+            self.assertEqual(len(app.state.gh_fed_ids), 500)
         finally:
             w.destroy()
 

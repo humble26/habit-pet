@@ -103,6 +103,8 @@ class HabitPetApp:
             # GitHub 云端连接
             "github_click": self._github_click,
             "github_label": self.github.menu_label,
+            "github_backfill": self._github_backfill,
+            "github_backfill_label": self._github_backfill_label,
             "alert_state": lambda: bool(
                 self.cfg["balance"].get("alert_enabled", True)),
             # 交互设置
@@ -176,7 +178,8 @@ class HabitPetApp:
                 self._drain_balance_events()
                 self.credits.maybe_poll()
                 self._drain_credits_events()
-                self.github.maybe_poll(self.state.gh_last_event_id)
+                self.github.maybe_poll(self.state.gh_last_event_id,
+                                       set(self.state.gh_fed_ids))
                 self._drain_github_events()
             self._check_daily_roast(now)
         except Exception as e:
@@ -538,11 +541,50 @@ class HabitPetApp:
                 "GitHub 连接已在 config.json 里关闭（github.enabled = false）。",
                 secs=7)
             return
-        if self.github.maybe_poll(self.state.gh_last_event_id, force=True):
+        if self.github.maybe_poll(self.state.gh_last_event_id,
+                                  set(self.state.gh_fed_ids), force=True):
             self._manual_github = True
             self.window.show_bubble("正在连接 GitHub……", secs=5)
         else:
             self.window.show_bubble("GitHub 查询正忙，稍等再点一次。", secs=5)
+
+    def _record_gh_fed(self, payload: dict) -> None:
+        """把本轮真正喂过的事件 ID 记进 state，供后续轮询/补喂过滤（防双喂）。"""
+        ids = [str(x) for x in (payload.get("fed_ids") or []) if str(x)]
+        if not ids:
+            return
+        for i in ids:
+            if i not in self.state.gh_fed_ids:
+                self.state.gh_fed_ids.append(i)
+        if len(self.state.gh_fed_ids) > 500:
+            self.state.gh_fed_ids = self.state.gh_fed_ids[-500:]
+        self.state.dirty = True
+
+    def _github_backfill_label(self) -> str:
+        return ("补喂云端历史：已补喂 ✓" if self.state.gh_backfilled
+                else "补喂云端历史推送")
+
+    def _github_backfill(self) -> None:
+        if not self.github.enabled():
+            self.window.show_bubble(
+                "GitHub 连接已在 config.json 里关闭（github.enabled = false）。",
+                secs=7)
+            return
+        if self.state.gh_backfilled:
+            self.window.show_bubble("云端历史已经补喂过啦（只补一次，防撑坏）。",
+                                    secs=8)
+            return
+        if self.state.runaway_until:
+            self.window.show_bubble("本鲸不在家，回来再谈补喂的事。", secs=6)
+            return
+        self._drain_github_events()      # 先清空已完成的轮询结果，防毫秒级双喂
+        if self.github.start_backfill(self.state.gh_last_event_id,
+                                      set(self.state.gh_fed_ids)):
+            self.window.show_bubble(
+                "正在翻找云端的历史推送……\n（要逐条补算提交数，可能要一两分钟）",
+                secs=12)
+        else:
+            self.window.show_bubble("GitHub 查询正忙，稍等再点一次。", secs=6)
 
     def _show_github_summary(self, payload: dict) -> None:
         login = payload.get("login") or "?"
@@ -567,6 +609,9 @@ class HabitPetApp:
         for kind, payload in self.github.drain():
             if kind != "github_done":
                 continue
+            if payload.get("backfill"):
+                self._drain_github_backfill(payload)
+                continue
             st = payload.get("status")
             if st in ("ok", "baseline"):
                 manual, self._manual_github = self._manual_github, False
@@ -579,6 +624,7 @@ class HabitPetApp:
                 if fed > 0:
                     repos = list((payload.get("fed_repos") or {}).keys())
                     self.state.feed(fed, remote=True, repos=repos)
+                self._record_gh_fed(payload)
                 self._drain_events()     # 立刻把 gh_connected / gh_feed 台词吐出来
                 if manual:
                     self._show_github_summary(payload)
@@ -588,6 +634,35 @@ class HabitPetApp:
                 if self._manual_github:
                     self._manual_github = False
                     self.window.show_bubble(f"GitHub：{note}", secs=10)
+
+    def _drain_github_backfill(self, payload: dict) -> None:
+        st = payload.get("status")
+        if st != "ok":
+            note = payload.get("note") or "补喂失败"
+            self._log(f"[github] 补喂：{note}")
+            self.window.show_bubble(f"补喂云端历史失败：{note}", secs=10)
+            return
+        fed = int(payload.get("fed") or 0)
+        n_repos = len(payload.get("fed_repos") or {})
+        days = int(payload.get("span_days") or 0)
+        if fed > 0:
+            repos = list((payload.get("fed_repos") or {}).keys())
+            self.state.feed(fed, remote=True, repos=repos)
+        self._record_gh_fed(payload)
+        self.state.gh_backfilled = True
+        cur = str(payload.get("cursor") or "")
+        if cur and not self.state.gh_last_event_id:
+            self.state.gh_last_event_id = cur     # 首连即补喂：补上正常轮询游标
+        self.state.dirty = True
+        self._drain_events()                      # 先把投喂/成就台词排进气泡队列
+        if fed > 0:
+            summary = (f"☁️ 云端历史补喂完成：\n"
+                       f"+{fed} 个 commit · {n_repos} 个仓库 · "
+                       f"覆盖最近约 {days} 天\n"
+                       f"（GitHub 活动接口最多回溯约 90 天）")
+        else:
+            summary = "云端历史没有可补喂的推送（或都已被喂过）。"
+        self.window.show_bubble(summary, secs=13)
 
     # ------------------------------------------------------------ 交互设置
 
