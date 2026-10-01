@@ -155,6 +155,22 @@ class TestDayRollAndSave(unittest.TestCase):
         self.assertEqual(st.satiety, 80.0)
         self.assertEqual(st.unlocked, {})
 
+    def test_load_non_dict_json_returns_fresh(self):
+        # 合法 JSON 但顶层是列表 → 属性访问会炸；必须安全回退新档
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "state.json"
+            path.write_text(json.dumps([1, 2, 3]), encoding="utf-8")
+            st = PetState.load(path, DEFAULT_MECHANICS)
+        self.assertEqual(st.satiety, 80.0)
+
+    def test_load_today_wrong_type_returns_fresh(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "state.json"
+            path.write_text(json.dumps({"satiety": 33, "today": ["oops"],
+                                        "history": {}}), encoding="utf-8")
+            st = PetState.load(path, DEFAULT_MECHANICS)
+        self.assertEqual(st.satiety, 80.0)
+
     def test_load_bad_dates_degrade_per_field(self):
         # 坏日期字段逐个回退，不丢整个存档
         with tempfile.TemporaryDirectory() as d:
@@ -191,6 +207,17 @@ class TestDayRollAndSave(unittest.TestCase):
         st.feed(1)
         ev = st.events[0]
         json.dumps(ev, ensure_ascii=False)   # 不应抛异常
+
+
+class TestStatusLines(unittest.TestCase):
+    def test_fixed_width_alignment(self):
+        """数值右对齐到 3 位宽、进度条 8 格：100 不会把面板撑折行。"""
+        st = make_state()
+        st.satiety = 100.0
+        lines = st.status_lines(dt.datetime.now())
+        self.assertIn("饱食度 ████████ 100", lines)
+        self.assertIn("心情　 ██████░░  70", lines)
+        self.assertTrue(any("陪伴第 1 天" in ln for ln in lines))
 
 
 if __name__ == "__main__":

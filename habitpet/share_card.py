@@ -9,7 +9,7 @@ from __future__ import annotations
 import datetime as dt
 from pathlib import Path
 
-from . import growth
+from . import __version__, growth
 from .report import week_summary
 from .state import PetState
 from .theme import ACCENT, CARD_BG, DEEP, HAIR, MUTED
@@ -114,8 +114,8 @@ def render_weekly_card(state: PetState, out_dir: Path) -> Path | None:
         y += step
 
     d.text((40, CARD_H - 48),
-           f"Habit Pet v0.6.0 · 鲸鱼娘版 · 数据只留在你电脑/你的 GitHub 账号 · "
-           f"生成于 {today.isoformat()}",
+           f"Habit Pet v{__version__} · 鲸鱼娘版 · "
+           f"数据只留在你电脑/你的 GitHub 账号 · 生成于 {today.isoformat()}",
            fill=MUTED, font=_font(18))
 
     out_dir.mkdir(parents=True, exist_ok=True)

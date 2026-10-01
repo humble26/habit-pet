@@ -192,5 +192,5 @@ def achievement_status(state: "PetState") -> list[str]:
         nxt = locked[0]
         lines.append(f"🔒 下一项：{nxt.title}（{nxt.desc}）")
     if len(unlocked) > 8:
-        lines.append(f"…等 {len(unlocked)} 项")
+        lines.append(f"…另有 {len(unlocked) - 8} 枚已点亮")
     return lines

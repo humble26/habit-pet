@@ -26,6 +26,7 @@ MIN_POLL_SECONDS = 60            # 也覆盖 GitHub 的 X-Poll-Interval 下限
 BASELINE_WINDOW_HOURS = 24
 BASELINE_MAX_COMMITS = 40
 MAX_COMPARES_PER_POLL = 12       # 单轮最多补算多少次提交数（防极端批量）
+COUNT_FAIL_GIVEUP = 3            # 同一事件连续补算失败多少次后不再退游标等它
 BACKFILL_MAX_PAGES = 3           # 历史补喂翻页上限（GitHub 事件接口本身也限页）
 _UA = "habit-pet/0.6 (desktop pet; +https://github.com/humble26/habit-pet)"
 
@@ -135,6 +136,11 @@ def parse_push_events(events: list[dict]) -> list[dict]:
             "head": str(payload.get("head") or ""),
         })
     return out
+
+
+def _count_key(p: dict) -> str:
+    """compare 补算的缓存键：优先 push_id，没有就用 仓库:head。"""
+    return str(p.get("push_id") or f"{p['repo']}:{p.get('head') or ''}")
 
 
 def _as_int(value) -> Optional[int]:
@@ -271,6 +277,8 @@ class GitHubPoller:
         self._etag = ""
         self._poll_floor = 0
         self._count_cache: dict = {}     # push_id → 提交数（compare 补算缓存）
+        self._fail_streak: dict = {}     # key → 连续失败次数（放上限防死循环）
+        self._last_today = None          # 最近一次有效「今日推送」数（304 沿用）
         self._last: dict = {}
         self._running = False
         self._last_poll = 0.0
@@ -374,9 +382,10 @@ class GitHubPoller:
         remote = [p for p in pushes
                   if p["repo"].lower() not in local and p["id"] not in fed_ids]
         budget = [len(remote) + 10]          # 一次性动作，放开单轮上限
+        fails: list = []
         fed, fed_repos, fed_ids_out = 0, {}, []
         for p in remote:
-            p["commits"] = self._count_of(p, budget)
+            p["commits"] = self._count_of(p, budget, fails)
             if p["commits"] > 0 and self.conf.get("feed", True):
                 fed += p["commits"]
                 fed_repos[p["repo"]] = fed_repos.get(p["repo"], 0) + p["commits"]
@@ -388,6 +397,7 @@ class GitHubPoller:
         return {"status": "ok", "backfill": True, "login": login, "mode": mode,
                 "cursor": cursor or newest,
                 "fed": fed, "fed_repos": fed_repos, "fed_ids": fed_ids_out,
+                "failed": len(fails),
                 "events": len(events), "pushes": len(remote),
                 "span_days": span_days, "recent": [],
                 "note": "GitHub 活动接口最多回溯约 90 天",
@@ -434,11 +444,13 @@ class GitHubPoller:
 
     # ------------------------------------------------------------ 取数
 
-    def _count_of(self, p: dict, budget: list[int]) -> int:
+    def _count_of(self, p: dict, budget: list[int],
+                  fails: Optional[list] = None) -> int:
         """补齐单个事件的提交数（事件接口精简 payload 时走 compare 补算）。
 
-        结果按 push_id 缓存在进程内，同一事件多轮出现不重复请求；
-        无法确定时按 0 计（宁少喂不双喂）。
+        成功结果按 push_id 缓存在进程内，同一事件多轮出现不重复请求；
+        失败（网络/接口/本轮预算用尽）按 0 计且**不缓存**——下轮重试不漏喂；
+        给 fails 传列表时记录这些 key（调用方据此把游标退住等重试）。
         """
         if isinstance(p.get("commits"), int):
             return p["commits"]
@@ -447,14 +459,22 @@ class GitHubPoller:
         # 全零 head=分支删除、全零/缺失 before=首推分支，都无法 compare
         if not head or not head.strip("0") or not before or not before.strip("0"):
             return 0
-        key = str(p.get("push_id") or f"{p['repo']}:{head}")
+        key = _count_key(p)
         if key in self._count_cache:
             return self._count_cache[key]
-        if budget[0] <= 0:
+        if budget[0] <= 0:                   # 预算用尽也要记：下轮重试
+            if fails is not None:
+                fails.append(key)
             return 0
         budget[0] -= 1
         n = self.client.compare_commits(p["repo"], before, head)
-        n = max(0, int(n)) if isinstance(n, int) else 0
+        if n is None:                        # 失败不缓存：下轮重试
+            self._fail_streak[key] = self._fail_streak.get(key, 0) + 1
+            if fails is not None:
+                fails.append(key)
+            return 0
+        self._fail_streak.pop(key, None)
+        n = max(0, int(n))
         if len(self._count_cache) > 500:      # 防无界增长
             self._count_cache.clear()
         self._count_cache[key] = n
@@ -495,10 +515,13 @@ class GitHubPoller:
                     "note": r.get("note") or "网络或接口错误"}
         if st == "none":                      # 304：无新事件，沿用上次观测
             prev = self._last or {}
+            today = prev.get("today_pushes")
+            if not isinstance(today, int):
+                today = getattr(self, "_last_today", None)
             return {"status": "ok", "login": login,
                     "mode": prev.get("mode", mode), "cursor": cursor,
                     "fed": 0, "fed_repos": {}, "fed_ids": [],
-                    "today_pushes": prev.get("today_pushes"),
+                    "today_pushes": today,
                     "recent": prev.get("recent") or [],
                     "rate_left": prev.get("rate_left"),
                     "note": "没有新动态", "no_change": True,
@@ -513,16 +536,20 @@ class GitHubPoller:
             mode = "anon"
         pushes = parse_push_events(r.get("events") or [])
         budget = [MAX_COMPARES_PER_POLL]
+        fails: list = []                     # 没数清的 key：游标退住下轮重试
         for p in pushes:                     # 精简 payload → compare 补算提交数
             if p.get("commits") is None:
-                p["commits"] = self._count_of(p, budget)
+                p["commits"] = self._count_of(p, budget, fails)
         local = self.local_names()
-        remote = [p for p in pushes if p["repo"].lower() not in local]
+        # 先滤掉已喂过的事件再进基线，防已喂事件吃掉 40 commit 的基线配额
+        remote = [p for p in pushes
+                  if p["repo"].lower() not in local and p["id"] not in fed_ids]
 
         today = dt.datetime.now().astimezone().date()
         today_pushes = sum(
             p["commits"] for p in pushes
             if p["at"] and p["at"].astimezone().date() == today)
+        self._last_today = today_pushes          # 304 时继续沿用
 
         # ---- 相对游标截取新事件
         baseline = False
@@ -537,6 +564,30 @@ class GitHubPoller:
         new_pushes = [p for p in new_pushes if p["id"] not in fed_ids]
 
         newest = next((p["id"] for p in pushes if p["id"]), "") or cursor
+        # 本轮有事件没数清（compare 失败/预算用尽）：游标退回到最早一条的
+        # 前一条（列表新→旧，往后一格），下轮重扫重数——已数对的走缓存不
+        # 再请求，喂过的由 fed_ids 滤掉，不会重复请求、不会重复投喂。
+        # 连败达到 COUNT_FAIL_GIVEUP 的事件不再等它（防永远卡住游标）。
+        if fails:
+            fail_keys = set(fails)
+            if baseline:                     # 基线：只等 24h 窗口内该喂的
+                since = dt.datetime.now(dt.timezone.utc) - dt.timedelta(
+                    hours=BASELINE_WINDOW_HOURS)
+                pool = [p for p in remote if p["at"] and p["at"] >= since]
+            else:                            # 游标：等该扫的新事件
+                pool = [p for p in pushes[:idx]
+                        if p["repo"].lower() not in local]
+            stuck = {p["id"] for p in pool
+                     if p["id"] and _count_key(p) in fail_keys
+                     and self._fail_streak.get(_count_key(p), 0)
+                     < COUNT_FAIL_GIVEUP}
+            if stuck:
+                i_old = max(i for i, p in enumerate(pushes)
+                            if p["id"] in stuck)
+                if i_old + 1 < len(pushes) and pushes[i_old + 1]["id"]:
+                    newest = pushes[i_old + 1]["id"]
+                else:
+                    newest = cursor          # 没有更老的参照：游标不动
 
         fed_repos: dict[str, int] = {}
         fed, fed_ids_out = 0, []

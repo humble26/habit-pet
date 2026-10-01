@@ -76,6 +76,7 @@ class HabitPetApp:
         self._frame = 0
         self._smoke = smoke
         self._roast_running = False
+        self._after_jobs: dict[str, str] = {}   # 循环定时器登记（销毁时统一撤）
         # Tkinter 的 after/event 非线程安全：工作线程只往队列里放结果，
         # 由主线程的 _second_loop 消费
         self._ui_queue: "queue.Queue[tuple]" = queue.Queue()
@@ -113,6 +114,7 @@ class HabitPetApp:
             "sound_set": self._set_sound,
             "sound_pack": self._sound_pack_state,
             "quit": self._quit,
+            "on_destroy": self._cancel_after_jobs,   # 窗口销毁时撤掉循环定时器
         }
         window.callbacks.update(self.callbacks)
 
@@ -124,12 +126,23 @@ class HabitPetApp:
                 "右键我 → 打开数据文件夹，把你的 git 仓库路径填进 config.json，"
                 "commit 就能把我喂饱啦。", secs=12)
         if smoke:
-            window.after(4000, self._smoke_finish)
+            self._after(4000, "smoke", self._smoke_finish)
+        self._after(200, "fast", self._fast_loop)
+        self._after(1000, "second", self._second_loop)
+        self._after(5000, "git", self._git_loop)
+        self._after(60000, "autosave", self._autosave_loop)
 
-        window.after(200, self._fast_loop)
-        window.after(1000, self._second_loop)
-        window.after(5000, self._git_loop)
-        window.after(60000, self._autosave_loop)
+    def _after(self, ms: int, tag: str, fn) -> None:
+        """登记循环定时器：窗口销毁时统一撤销，防退出后残留回调报错。"""
+        self._after_jobs[tag] = self.window.after(ms, fn)
+
+    def _cancel_after_jobs(self) -> None:
+        for job in list(self._after_jobs.values()):
+            try:
+                self.window.after_cancel(job)
+            except Exception:
+                pass
+        self._after_jobs.clear()
 
     # ------------------------------------------------------------ 日志
 
@@ -144,7 +157,7 @@ class HabitPetApp:
 
     def _restore_window_pos(self) -> None:
         x, y = self.state.window_x, self.state.window_y
-        if x < 0 or y < 0:
+        if x == -1 and y == -1:            # 哨兵：从未设置过（负坐标是合法的贴边位）
             self.window.place_default()
         else:
             self.window.place_at(x, y)     # 存档位置也夹在屏幕内
@@ -165,7 +178,7 @@ class HabitPetApp:
                                focus=focus_info)
         except Exception as e:
             self._log(f"[fast_loop] {e!r}")
-        self.window.after(150, self._fast_loop)
+        self._after(150, "fast", self._fast_loop)
 
     def _second_loop(self) -> None:
         try:
@@ -184,7 +197,7 @@ class HabitPetApp:
             self._check_daily_roast(now)
         except Exception as e:
             self._log(f"[second_loop] {e!r}")
-        self.window.after(1000, self._second_loop)
+        self._after(1000, "second", self._second_loop)
 
     def _git_loop(self) -> None:
         try:
@@ -201,8 +214,8 @@ class HabitPetApp:
         except Exception as e:
             self._log(f"[git_loop] {e!r}")
         # 下限 30 秒，防止配置成 0/negative 造成忙轮询
-        self.window.after(max(int(self.cfg["git_poll_seconds"]), 30) * 1000,
-                          self._git_loop)
+        self._after(max(int(self.cfg["git_poll_seconds"]), 30) * 1000,
+                    "git", self._git_loop)
 
     def _autosave_loop(self) -> None:
         try:
@@ -210,7 +223,7 @@ class HabitPetApp:
                 self._save()
         except Exception as e:
             self._log(f"[autosave] {e!r}")
-        self.window.after(60000, self._autosave_loop)
+        self._after(60000, "autosave", self._autosave_loop)
 
     # ------------------------------------------------------------ 事件 → 台词
 
@@ -615,6 +628,12 @@ class HabitPetApp:
             st = payload.get("status")
             if st in ("ok", "baseline"):
                 manual, self._manual_github = self._manual_github, False
+                if self.state.runaway_until:
+                    # 离家期间不消费云端事件：不喂、不动游标、不记已喂
+                    # （回来后再吃，和本地 git 扫描"离家暂停"同口径）
+                    if manual:
+                        self._show_github_summary(payload)
+                    continue
                 self.state.connect_github(str(payload.get("login") or ""))
                 cur = str(payload.get("cursor") or "")
                 if cur and cur != self.state.gh_last_event_id:
@@ -642,25 +661,38 @@ class HabitPetApp:
             self._log(f"[github] 补喂：{note}")
             self.window.show_bubble(f"补喂云端历史失败：{note}", secs=10)
             return
+        if self.state.runaway_until:
+            # 不喂不记账不置一次性标记：她回来还能再补
+            self.window.show_bubble("本鲸不在家，补喂先留着，回来再吃。", secs=8)
+            return
         fed = int(payload.get("fed") or 0)
+        failed = int(payload.get("failed") or 0)
         n_repos = len(payload.get("fed_repos") or {})
         days = int(payload.get("span_days") or 0)
         if fed > 0:
             repos = list((payload.get("fed_repos") or {}).keys())
             self.state.feed(fed, remote=True, repos=repos)
         self._record_gh_fed(payload)
-        self.state.gh_backfilled = True
         cur = str(payload.get("cursor") or "")
         if cur and not self.state.gh_last_event_id:
             self.state.gh_last_event_id = cur     # 首连即补喂：补上正常轮询游标
         self.state.dirty = True
         self._drain_events()                      # 先把投喂/成就台词排进气泡队列
-        if fed > 0:
+        if fed > 0 and failed == 0:
+            self.state.gh_backfilled = True       # 完整成功才烧掉一次性机会
             summary = (f"☁️ 云端历史补喂完成：\n"
                        f"+{fed} 个 commit · {n_repos} 个仓库 · "
                        f"覆盖最近约 {days} 天\n"
                        f"（GitHub 活动接口最多回溯约 90 天）")
+        elif fed > 0:
+            summary = (f"☁️ 补喂了一部分：+{fed} 个 commit · {n_repos} 个仓库\n"
+                       f"还有 {failed} 条没补上（网络），稍后再点一次补齐——\n"
+                       f"喂过的不会重复喂")
+        elif failed > 0:
+            summary = (f"补喂遇到网络问题（{failed} 条失败），"
+                       f"稍后再点一次试试。")
         else:
+            self.state.gh_backfilled = True
             summary = "云端历史没有可补喂的推送（或都已被喂过）。"
         self.window.show_bubble(summary, secs=13)
 

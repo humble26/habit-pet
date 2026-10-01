@@ -12,7 +12,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from habitpet.pet_window import (ART_BOX_FALLBACK, TASKBAR_MARGIN,
+from habitpet.pet_window import (ART_BOX_FALLBACK, H, TASKBAR_MARGIN, W,
                                  PetWindow)
 
 
@@ -20,6 +20,19 @@ def _pos(w) -> tuple[int, int]:
     """读取请求的窗口位置（"+x+y"），withdrawn 状态下也可靠。"""
     _size, x, y = w.geometry().split("+")
     return int(x), int(y)
+
+
+def _app_with_window(w: PetWindow):
+    """隔离配置目录起一个 app（全离线）。"""
+    from habitpet.app import HabitPetApp
+    cfgdir = Path(tempfile.mkdtemp(prefix="habitpet_pos_"))
+    (cfgdir / "config.json").write_text(json.dumps({
+        "repos": [], "llm": {"enabled": False},
+        "sound": {"enabled": False}, "balance": {"enabled": False},
+        "credits": {"enabled": False},
+        "github": {"enabled": False},
+    }, ensure_ascii=False), encoding="utf-8")
+    return HabitPetApp(w, cfgdir)
 
 
 LEFT, _TOP, RIGHT, BOTTOM = ART_BOX_FALLBACK
@@ -90,18 +103,9 @@ class TestPositionClamp(unittest.TestCase):
             w.destroy()
 
     def test_restore_offscreen_saved_pos_clamped(self):
-        from habitpet.app import HabitPetApp
-        cfgdir = Path(tempfile.mkdtemp(prefix="habitpet_pos_"))
-        (cfgdir / "config.json").write_text(json.dumps({
-            "repos": [], "llm": {"enabled": False},
-            "sound": {"enabled": False}, "balance": {"enabled": False},
-            "credits": {"enabled": False},
-            "github": {"enabled": False},
-        }, ensure_ascii=False), encoding="utf-8")
-        w = PetWindow(callbacks={})
-        w.withdraw()
+        w = self._win()
         try:
-            app = HabitPetApp(w, cfgdir)
+            app = _app_with_window(w)
             app.state.window_x = 999999
             app.state.window_y = 999999
             app._restore_window_pos()
@@ -109,6 +113,29 @@ class TestPositionClamp(unittest.TestCase):
                 _pos(w),
                 (w.winfo_screenwidth() - RIGHT,
                  w.winfo_screenheight() - TASKBAR_MARGIN - BOTTOM))
+        finally:
+            w.destroy()
+
+    def test_restore_negative_saved_pos_kept(self):
+        """贴左缘的负坐标是合法停车位，不能被当哨兵改默认位。"""
+        w = self._win()
+        try:
+            app = _app_with_window(w)
+            app.state.window_x, app.state.window_y = -46, 60
+            app._restore_window_pos()
+            self.assertEqual(_pos(w), (-46, 60))
+        finally:
+            w.destroy()
+
+    def test_restore_sentinel_goes_default(self):
+        """(-1,-1)=从未摆过 → 走默认位（右下角）。"""
+        w = self._win()
+        try:
+            app = _app_with_window(w)
+            app.state.window_x, app.state.window_y = -1, -1
+            app._restore_window_pos()
+            self.assertEqual(_pos(w), (w.winfo_screenwidth() - W - 30,
+                                       w.winfo_screenheight() - H - 80))
         finally:
             w.destroy()
 

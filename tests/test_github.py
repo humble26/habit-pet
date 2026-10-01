@@ -306,6 +306,20 @@ class TestFetch(unittest.TestCase):
         send = sess.calls[1][2]
         self.assertEqual(send.get("If-None-Match"), "e1")
 
+    def test_304_falls_back_to_last_today(self):
+        """304 时上次结果若缺 today_pushes，用进程内最近观测兜底。"""
+        events = [ev("id1", "me/remote", 2)]
+        sess = FakeSession(gets=[self._events_resp(events, etag="e1"),
+                                 FakeResp({}, 304)])
+        p = poller_with([], login="me", token="t0")
+        p.client._session = sess
+        first = p._fetch("")
+        self.assertEqual(p._last_today, 2)
+        p._last = {"status": "ok", "cursor": first["cursor"]}   # 缺字段
+        second = p._fetch(first["cursor"])
+        self.assertTrue(second.get("no_change"))
+        self.assertEqual(second["today_pushes"], 2)
+
     def test_401_refreshes_token_then_retries(self):
         events = [ev("id1", "me/remote", 1)]
         sess = FakeSession(gets=[FakeResp({}, 401),
@@ -438,6 +452,68 @@ class TestReducedPayloadCompare(unittest.TestCase):
         r = p._fetch("")
         self.assertEqual(r["status"], "baseline")
         self.assertEqual(r["fed"], 0)
+
+    def test_compare_failure_holds_cursor_and_retries(self):
+        """compare 失败不缓存：游标退住重扫，下轮补喂（不漏喂）。"""
+        events = [reduced_ev("id2", "me/a", "a" * 40, "b" * 40, push_id=1),
+                  reduced_ev("id1", "me/b", "c" * 40, "d" * 40, push_id=2)]
+        sess = FakeSession(gets=[FakeResp(events, 200, {}),
+                                 FakeResp({"total_commits": 2}, 200, {}),
+                                 FakeResp({}, 404, {}),
+                                 FakeResp(events, 200, {}),
+                                 FakeResp({"total_commits": 5}, 200, {})])
+        p = poller_with([], login="me", token="t0")
+        p.client._session = sess
+        first = p._fetch("")
+        self.assertEqual(first["fed"], 2)             # 只喂上 id2
+        self.assertEqual(first["fed_ids"], ["id2"])
+        self.assertEqual(first["cursor"], "")         # 游标退住：本轮不前进
+        # 下轮重扫：id2 走缓存不再请求 compare，id1 重试成功补喂
+        second = p._fetch(first["cursor"], {"id2"})
+        self.assertEqual(second["fed"], 5)
+        self.assertEqual(second["fed_ids"], ["id1"])
+        self.assertEqual(second["cursor"], "id2")
+        compares = [c for c in sess.calls if "/compare/" in c[1]]
+        self.assertEqual(len(compares), 3)            # 2 / 失败 / 5，无重复请求
+
+    def test_cursor_holds_on_failed_count_and_recovers(self):
+        """游标路径：新事件数不清时游标停住，下轮补喂后再前进。"""
+        events = [reduced_ev("id3", "me/a", "a" * 40, "b" * 40, push_id=11),
+                  reduced_ev("id2", "me/b", "c" * 40, "d" * 40, push_id=12),
+                  reduced_ev("id1", "me/c", "e" * 40, "f" * 40, push_id=13)]
+        sess = FakeSession(gets=[FakeResp(events, 200, {}),
+                                 FakeResp({"total_commits": 1}, 200, {}),   # id3
+                                 FakeResp({}, 500, {}),                     # id2 失败
+                                 FakeResp({"total_commits": 1}, 200, {}),   # id1
+                                 FakeResp(events, 200, {}),
+                                 FakeResp({"total_commits": 4}, 200, {})])  # id2 重试
+        p = poller_with([], login="me", token="t0")
+        p.client._session = sess
+        first = p._fetch("id1")
+        self.assertEqual(first["status"], "ok")
+        self.assertEqual(first["fed"], 1)             # 只喂上 id3
+        self.assertEqual(first["fed_ids"], ["id3"])
+        self.assertEqual(first["cursor"], "id1")      # 游标停住（不再前进）
+        second = p._fetch(first["cursor"], {"id3"})
+        self.assertEqual(second["fed"], 4)            # id2 补喂成功
+        self.assertEqual(second["fed_ids"], ["id2"])
+        self.assertEqual(second["cursor"], "id3")     # 补上后游标恢复前进
+
+    def test_compare_giveup_releases_cursor(self):
+        """同一事件连败 COUNT_FAIL_GIVEUP 次后放行游标，不被永久卡住。"""
+        events = [reduced_ev("id1", "me/a", "a" * 40, "b" * 40, push_id=9)]
+        gets = []
+        for _ in range(3):
+            gets += [FakeResp(events, 200, {}), FakeResp({}, 404, {})]
+        sess = FakeSession(gets=gets)
+        p = poller_with([], login="me", token="t0")
+        p.client._session = sess
+        cursors = []
+        for _ in range(3):
+            r = p._fetch(cursors[-1] if cursors else "")
+            cursors.append(r["cursor"])
+        self.assertEqual(cursors, ["", "", "id1"])    # 第三次不再退住
+        self.assertEqual(p._fail_streak.get("9"), 3)
 
 
 class TestBackfill(unittest.TestCase):
@@ -722,6 +798,86 @@ class TestAppDrain(unittest.TestCase):
             app._github_backfill()
             self.assertFalse(app.github._running)
             self.assertEqual(app.state.gh_remote_commits, 5)
+        finally:
+            w.destroy()
+
+    def test_drain_backfill_partial_failure_keeps_retryable(self):
+        """补喂部分成功：喂到的照收，但一次性标记留着，可以再点补上。"""
+        app, w = self._make_app(github_enabled=True)
+        try:
+            app.github._queue.put(("github_done", {
+                "status": "ok", "backfill": True, "login": "humble26",
+                "cursor": "idNew", "fed": 5, "fed_repos": {"a/b": 5},
+                "fed_ids": ["z1"], "failed": 2, "span_days": 25,
+                "pushes": 10, "events": 87, "recent": [], "note": "",
+                "at": "10-01 16:00"}))
+            app._drain_github_events()
+            self.assertFalse(app.state.gh_backfilled)
+            self.assertEqual(app.state.gh_remote_commits, 5)
+            self.assertEqual(app.state.gh_fed_ids, ["z1"])
+        finally:
+            w.destroy()
+
+    def test_drain_backfill_total_failure(self):
+        app, w = self._make_app(github_enabled=True)
+        try:
+            app.github._queue.put(("github_done", {
+                "status": "ok", "backfill": True, "login": "humble26",
+                "cursor": "", "fed": 0, "fed_repos": {}, "fed_ids": [],
+                "failed": 3, "span_days": 0, "pushes": 3, "events": 5,
+                "recent": [], "note": "", "at": "10-01 16:00"}))
+            app._drain_github_events()
+            self.assertFalse(app.state.gh_backfilled)
+            self.assertEqual(app.state.gh_remote_commits, 0)
+        finally:
+            w.destroy()
+
+    def test_drain_backfill_nothing_to_feed_flags_done(self):
+        app, w = self._make_app(github_enabled=True)
+        try:
+            app.github._queue.put(("github_done", {
+                "status": "ok", "backfill": True, "login": "humble26",
+                "cursor": "", "fed": 0, "fed_repos": {}, "fed_ids": [],
+                "failed": 0, "span_days": 0, "pushes": 0, "events": 3,
+                "recent": [], "note": "", "at": "10-01 16:00"}))
+            app._drain_github_events()
+            self.assertTrue(app.state.gh_backfilled)   # 没有可喂的也算补完
+        finally:
+            w.destroy()
+
+    def test_runaway_defers_backfill(self):
+        """离家期间补喂结果全部留着：不喂、不记账、不烧一次性标记。"""
+        app, w = self._make_app(github_enabled=True)
+        try:
+            app.state.runaway_until = "2099-01-01T00:00:00"
+            app.github._queue.put(("github_done", {
+                "status": "ok", "backfill": True, "login": "humble26",
+                "cursor": "idNew", "fed": 5, "fed_repos": {"a/b": 5},
+                "fed_ids": ["z1"], "failed": 0, "span_days": 25,
+                "pushes": 10, "events": 87, "recent": [], "note": "",
+                "at": "10-01 16:00"}))
+            app._drain_github_events()
+            self.assertFalse(app.state.gh_backfilled)
+            self.assertEqual(app.state.gh_remote_commits, 0)
+            self.assertEqual(app.state.gh_fed_ids, [])
+        finally:
+            w.destroy()
+
+    def test_runaway_skips_cloud_events(self):
+        """离家期间轮询到的事件不消费：回来再吃（和本地扫描同口径）。"""
+        app, w = self._make_app()
+        try:
+            app.state.runaway_until = "2099-01-01T00:00:00"
+            app.github._queue.put(("github_done", {
+                "status": "ok", "login": "humble26", "cursor": "idX",
+                "fed": 3, "fed_repos": {"a/b": 3}, "fed_ids": ["id1"],
+                "today_pushes": 8, "recent": [], "note": "",
+                "at": "10-01 12:00"}))
+            app._drain_github_events()
+            self.assertEqual(app.state.gh_login, "")
+            self.assertEqual(app.state.gh_last_event_id, "")
+            self.assertEqual(app.state.gh_remote_commits, 0)
+            self.assertEqual(app.state.gh_fed_ids, [])
         finally:
             w.destroy()
 

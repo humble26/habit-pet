@@ -1,6 +1,7 @@
 """日报/周报生成测试。"""
 from __future__ import annotations
 
+import datetime as dt
 import tempfile
 import unittest
 from pathlib import Path
@@ -33,6 +34,16 @@ class TestReports(unittest.TestCase):
         s = week_summary(self.st)
         self.assertEqual(s["total"]["commits"], 3)
         self.assertEqual(len(s["days"]), 7)
+
+    def test_week_summary_tolerates_missing_keys(self):
+        """老存档的 history 条目缺新字段（gh_pushes 等）不许 KeyError。"""
+        d2 = (dt.date.today() - dt.timedelta(days=2)).isoformat()
+        self.st.history = {d2: {"date": d2}}      # 只留下最小字段
+        s = week_summary(self.st)
+        self.assertEqual(len(s["days"]), 7)
+        self.assertEqual(s["total"]["gh_pushes"], 0)
+        self.assertEqual(s["total"]["focus_count"], 0)
+        self.assertEqual(s["total"]["commits"], 3)   # today 的数据照常计入
 
     def test_weekly_report_written(self):
         n = Narrator({"enabled": True, "api_key": "", "model": "x", "base_url": ""})

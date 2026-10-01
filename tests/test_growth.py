@@ -165,6 +165,18 @@ class TestAchievements(unittest.TestCase):
         self.assertTrue(any("成就" in line for line in lines))
         self.assertTrue(any("初见鲸喜" in line for line in lines))
 
+    def test_achievement_fold_line_when_many(self):
+        """点亮超过 8 枚时折叠：只展示前 8 枚 + 一行「另有 N 枚」。"""
+        st = make_state()
+        for a in growth.ACHIEVEMENTS:
+            st.unlocked[a.id] = "2026-01-01"
+        n = len(growth.ACHIEVEMENTS)
+        lines = growth.achievement_status(st)
+        self.assertTrue(
+            any(line == f"…另有 {n - 8} 枚已点亮" for line in lines))
+        self.assertFalse(any(line.startswith("🔒") for line in lines))
+        self.assertEqual(sum(1 for ln in lines if ln.startswith("✅")), 8)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -23,11 +23,11 @@ def week_summary(state: PetState) -> dict:
                                               "roasts": 0, "focus_count": 0,
                                               "gh_pushes": 0}))
     total = {
-        "commits": sum(d["commits"] for d in days),
-        "active_hours": round(sum(d["active_minutes"] for d in days) / 60, 1),
-        "sit_hits": sum(d["sit_hits"] for d in days),
-        "breaks": sum(d["breaks"] for d in days),
-        "late_hours": round(sum(d["late_minutes"] for d in days) / 60, 1),
+        "commits": sum(d.get("commits", 0) for d in days),
+        "active_hours": round(sum(d.get("active_minutes", 0) for d in days) / 60, 1),
+        "sit_hits": sum(d.get("sit_hits", 0) for d in days),
+        "breaks": sum(d.get("breaks", 0) for d in days),
+        "late_hours": round(sum(d.get("late_minutes", 0) for d in days) / 60, 1),
         "focus_count": sum(d.get("focus_count", 0) for d in days),
         "gh_pushes": sum(d.get("gh_pushes", 0) for d in days),
     }

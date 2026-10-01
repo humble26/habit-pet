@@ -368,20 +368,24 @@ class PetState:
         return "idle"
 
     @staticmethod
-    def _bar(v: float, width: int = 10) -> str:
+    def _bar(v: float, width: int = 8) -> str:
         filled = round(clamp(v) / 100 * width)
         return "█" * filled + "░" * (width - filled)
 
     def status_lines(self, now: dt.datetime) -> list[str]:
+        """状态面板：固定列宽、数值右对齐，防折行（供气泡卡渲染）。"""
+        days = (now - dt.datetime.fromisoformat(self.born_at)).days + 1
+        need = growth.next_stage_need(self)
         lines = [
-            f"🐋 {growth.stage_name(self)} · 陪伴 {(now - dt.datetime.fromisoformat(self.born_at)).days + 1} 天",
-            f"饱食度 {self._bar(self.satiety)} {self.satiety:.0f}",
-            f"心情   {self._bar(self.mood)} {self.mood:.0f}",
-            f"健康   {self._bar(self.health)} {self.health:.0f}",
-            f"寿命   {self._bar(self.lifespan_max)} {self.lifespan_max:.0f}",
-            f"连续活跃 {self.active_streak} 天（最高 {self.best_streak}）· "
-            f"成长值 {growth.growth_points(self)}",
-            f"累计 commit 喂食 {self.total_commits} 次"
+            f"🐋 {growth.stage_name(self)} · 陪伴第 {days} 天",
+            f"饱食度 {self._bar(self.satiety)} {self.satiety:3.0f}",
+            f"心情　 {self._bar(self.mood)} {self.mood:3.0f}",
+            f"健康　 {self._bar(self.health)} {self.health:3.0f}",
+            f"寿命　 {self._bar(self.lifespan_max)} {self.lifespan_max:3.0f}",
+            f"连续活跃 {self.active_streak} 天 · 最高 {self.best_streak} 天",
+            f"成长值 {growth.growth_points(self)}"
+            + (f" · 进化还需 {need}" if need is not None else " · 已满阶"),
+            f"累计喂食 {self.total_commits} 次"
             + (f" · 云端投喂 {self.gh_remote_commits}" if self.gh_login else ""),
         ]
         if self.focus:
@@ -473,6 +477,8 @@ class PetState:
             data = json.loads(path.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, OSError):
             return st
+        if not isinstance(data, dict):      # 顶层坏了（列表/空值等）→ 新档
+            return st
         try:
             # 数值/容器字段：类型不对就整体回退新档
             st.satiety = clamp(float(data.get("satiety", 80)))
@@ -494,7 +500,7 @@ class PetState:
             st.gh_remote_commits = int(data.get("gh_remote_commits", 0))
             st.today = DayStats.from_dict(data.get("today", {}))
             st.history = dict(data.get("history", {}))
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, AttributeError):
             return cls(mechanics)
         # 日期字段：坏值逐个回退，不丢弃整个存档
         st.born_at = _safe_iso(data.get("born_at"), st.born_at)
