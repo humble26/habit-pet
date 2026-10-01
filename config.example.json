@@ -4,6 +4,37 @@
     "C:\\Users\\you\\projects\\another-repo"
   ],
   "git_poll_seconds": 300,
+  "pet_image": "",
+  "snap": true,
+  "sound": {
+    "enabled": true,
+    "pack": "duck"
+  },
+  "balance": {
+    "enabled": true,
+    "poll_seconds": 300,
+    "low_alert": 0.0,
+    "alert_enabled": true,
+    "api_key": ""
+  },
+  "credits": {
+    "enabled": true,
+    "poll_seconds": 1800,
+    "providers": {
+      "trae_cn": { "enabled": true },
+      "traework_cn": { "enabled": true },
+      "workbuddy": { "enabled": true },
+      "qoder_cn": { "enabled": true }
+    },
+    "workbuddy_token": ""
+  },
+  "github": {
+    "enabled": true,
+    "poll_seconds": 300,
+    "username": "",
+    "token": "",
+    "feed": true
+  },
   "llm": {
     "enabled": true,
     "api_key": "",

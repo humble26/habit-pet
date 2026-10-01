@@ -23,24 +23,24 @@ def roll_to(st: PetState, today: dt.date, *, commits: int = 0,
 
 
 class TestStages(unittest.TestCase):
-    def test_new_pet_is_kitten(self):
+    def test_new_pet_is_calf(self):
         st = make_state()
-        self.assertEqual(growth.stage_name(st), "幼猫")
+        self.assertEqual(growth.stage_name(st), "幼鲸")
         self.assertAlmostEqual(growth.stage_scale(st), 0.82)
         self.assertEqual(growth.stage_index(growth.growth_points(st)), 0)
 
     def test_feed_crossing_threshold_evolves(self):
         st = make_state()
-        st.feed(20)   # 20 commits → 成猫
+        st.feed(20)   # 20 commits → 鲸鱼娘
         self.assertEqual(st.stage_idx, 1)
         self.assertAlmostEqual(growth.stage_scale(st), 1.0)
-        self.assertTrue(any(e["kind"] == "stage_up" and e["stage"] == "成猫"
+        self.assertTrue(any(e["kind"] == "stage_up" and e["stage"] == "鲸鱼娘"
                             for e in st.events))
 
-    def test_big_cat_at_100(self):
+    def test_deep_whale_at_100(self):
         st = make_state()
         st.feed(100)
-        self.assertEqual(growth.stage_name(st), "大猫")
+        self.assertEqual(growth.stage_name(st), "深海鲸鱼娘")
         self.assertAlmostEqual(growth.stage_scale(st), 1.14)
 
     def test_stage_never_regresses(self):
@@ -163,7 +163,7 @@ class TestAchievements(unittest.TestCase):
         st.feed(1)
         lines = growth.achievement_status(st)
         self.assertTrue(any("成就" in line for line in lines))
-        self.assertTrue(any("开饭初心" in line for line in lines))
+        self.assertTrue(any("初见鲸喜" in line for line in lines))
 
 
 if __name__ == "__main__":

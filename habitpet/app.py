@@ -1,4 +1,4 @@
-"""主程序：把状态机、采集器、台词、UI 接到一起。"""
+"""主程序：把状态机、采集器、台词、音效、小鲸鱼记账、UI 接到一起。"""
 from __future__ import annotations
 
 import datetime as dt
@@ -10,14 +10,19 @@ import threading
 from pathlib import Path
 
 from .collectors.gitfeed import GitPoller
+from .collectors.github import GitHubPoller
 from .collectors import idle
 from . import autostart
+from .balance import BalanceTracker, format_money
+from .credits import CreditsTracker
 from . import growth
 from . import share_card
-from .config import load_config
+from .config import load_config, save_config
 from .narrator import Narrator
 from . import report as report_mod
+from .sound import PACKS, SoundPlayer
 from .state import PetState
+from .whale_art import ASSETS_DIR
 
 SPEAKABLE = ("feed", "treat", "sit_hit", "rested", "hungry",
              "late_night", "runaway", "came_home", "pet",
@@ -25,7 +30,8 @@ SPEAKABLE = ("feed", "treat", "sit_hit", "rested", "hungry",
              "stage_up", "streak_milestone", "streak_broken",
              "achievement",
              "focus_start", "focus_done", "focus_paused",
-             "focus_resumed", "focus_cancel")
+             "focus_resumed", "focus_cancel",
+             "gh_connected", "gh_feed")
 
 
 class HabitPetApp:
@@ -44,6 +50,28 @@ class HabitPetApp:
 
         self.narrator = Narrator(self.cfg["llm"], log=self._log)
         self.poller = GitPoller(self.cfg["repos"], log=self._log)
+
+        # 音效 & 小鲸鱼记账（并入 DSH 小鲸鱼挂件的玩法与功能）
+        snd_cfg = self.cfg.get("sound", {})
+        self.sound = SoundPlayer(ASSETS_DIR,
+                                 pack=str(snd_cfg.get("pack", "duck")),
+                                 enabled=bool(snd_cfg.get("enabled", True)),
+                                 log=self._log)
+        self.balance = BalanceTracker(config_dir, self.cfg.get("balance", {}),
+                                      log=self._log)
+        # 剩余积分：Trae CN / TraeWork CN / WorkBuddy / Qoder CN
+        self.credits = CreditsTracker(config_dir, self.cfg.get("credits", {}),
+                                      log=self._log)
+        # GitHub 云端连接（远程投喂 / 动态展示 / 专属成就）
+        self.github = GitHubPoller(self.cfg.get("github", {}),
+                                   repos=self.cfg["repos"], log=self._log)
+        self._manual_credits = False
+        self._manual_github = False
+        self._manual_balance = False
+        window.sound = self.sound
+        window.snap_enabled = bool(self.cfg.get("snap", True))
+        if self.cfg.get("pet_image") and hasattr(window, "sprite"):
+            window.sprite.set_image(self.cfg["pet_image"])
 
         self._frame = 0
         self._smoke = smoke
@@ -65,6 +93,23 @@ class HabitPetApp:
             "open_folder": self._open_folder,
             "autostart_state": autostart.is_enabled,
             "autostart_toggle": self._toggle_autostart,
+            # 小鲸鱼记账
+            "balance_click": self._balance_click,
+            "balance_label": self.balance.menu_label,
+            "alert_toggle": self._toggle_alert,
+            # 剩余积分
+            "credits_rows": self.credits.menu_rows,
+            "credits_click": self._credits_click,
+            # GitHub 云端连接
+            "github_click": self._github_click,
+            "github_label": self.github.menu_label,
+            "alert_state": lambda: bool(
+                self.cfg["balance"].get("alert_enabled", True)),
+            # 交互设置
+            "snap_toggle": self._toggle_snap,
+            "snap_state": lambda: bool(self.cfg.get("snap", True)),
+            "sound_set": self._set_sound,
+            "sound_pack": self._sound_pack_state,
             "quit": self._quit,
         }
         window.callbacks.update(self.callbacks)
@@ -73,9 +118,9 @@ class HabitPetApp:
         self._drain_events()
         if created:
             window.show_bubble(
-                "初次见面，我是你的 Habit Pet！\n"
+                "初次见面，我是你的鲸鱼娘！\n"
                 "右键我 → 打开数据文件夹，把你的 git 仓库路径填进 config.json，"
-                "commit 就能喂我啦。", secs=12)
+                "commit 就能把我喂饱啦。", secs=12)
         if smoke:
             window.after(4000, self._smoke_finish)
 
@@ -126,6 +171,13 @@ class HabitPetApp:
             self.state.tick(1.0, now, idle.is_active())
             self._drain_events()
             self._drain_ui_queue()
+            if not self._smoke:
+                self.balance.maybe_poll()
+                self._drain_balance_events()
+                self.credits.maybe_poll()
+                self._drain_credits_events()
+                self.github.maybe_poll(self.state.gh_last_event_id)
+                self._drain_github_events()
             self._check_daily_roast(now)
         except Exception as e:
             self._log(f"[second_loop] {e!r}")
@@ -165,6 +217,9 @@ class HabitPetApp:
             kind = ev.pop("kind")
             if kind in SPEAKABLE:
                 self.window.show_bubble(self.narrator.line(kind, **ev))
+            # 任务结束音：专注完成 / 进化（对应挂件的"每轮结束音"玩法）
+            if kind in ("focus_done", "stage_up"):
+                self.sound.task_done()
 
     # ------------------------------------------------------------ 交互回调
 
@@ -177,8 +232,11 @@ class HabitPetApp:
         self._drain_events()
 
     def _show_status(self) -> None:
-        self.window.show_bubble("\n".join(self.state.status_lines(dt.datetime.now())),
-                                secs=9)
+        lines = self.state.status_lines(dt.datetime.now())
+        lines += self.balance.status_lines()
+        lines += self.credits.status_lines()
+        lines += self.github.status_lines()
+        self.window.show_bubble("\n".join(lines), secs=11)
 
     def _show_achievements(self) -> None:
         self.window.show_bubble("\n".join(growth.achievement_status(self.state)),
@@ -190,7 +248,7 @@ class HabitPetApp:
         if self.state.focus:
             self.state.cancel_focus()
         elif self.state.runaway_until:
-            self.window.show_bubble("本喵不在家，专注个鬼。先把我哄回来。")
+            self.window.show_bubble("本鲸不在家，专注个鬼。先把我哄回来。")
             return
         else:
             self.state.start_focus()
@@ -223,7 +281,7 @@ class HabitPetApp:
 
     def _toggle_autostart(self) -> bool:
         enabled = autostart.toggle()
-        self.window.show_bubble("已开启开机自启，本喵以后自动上桌 🐾" if enabled
+        self.window.show_bubble("已开启开机自启，本鲸以后自动上桌 🐋" if enabled
                                 else "已关闭开机自启")
         return enabled
 
@@ -333,6 +391,238 @@ class HabitPetApp:
         else:
             subprocess.Popen(["xdg-open", str(self.config_dir)])
 
+    # ------------------------------------------------------------ 小鲸鱼记账
+
+    def _balance_click(self) -> None:
+        if not self.balance.conf.get("enabled", True):
+            self.window.show_bubble(
+                "小鲸鱼记账已在 config.json 里关闭（balance.enabled = false）。",
+                secs=7)
+            return
+        snap = self.balance.snapshot()
+        if not self.balance.enabled() and snap is None:
+            self.window.show_bubble(
+                "还没配 DeepSeek 余额查询的 key，三种方式任选：\n"
+                "① config.json 的 balance.api_key\n"
+                "② 环境变量 DEEPSEEK_API_KEY\n"
+                "③ DSH 凭据 ~/.dsh/.credentials.yaml（只读自动读取）",
+                secs=12)
+            return
+        if self.balance.maybe_poll(force=True):
+            self._manual_balance = True
+            if snap:
+                self.window.show_bubble(
+                    f"正在刷新余额……\n当前 "
+                    f"{format_money(snap['balance'], snap['currency'])}"
+                    f" · 今日已用 ≈ "
+                    f"{format_money(snap['today_used'], snap['currency'])}",
+                    secs=6)
+            else:
+                self.window.show_bubble("正在查询余额……", secs=6)
+        else:
+            self._show_balance_snapshot(fallback="查询正忙，稍等再点一次。")
+
+    def _show_balance_snapshot(self, fallback: str = "") -> None:
+        snap = self.balance.snapshot()
+        if snap:
+            self.window.show_bubble(
+                f"💰 余额 {format_money(snap['balance'], snap['currency'])}\n"
+                f"今日已用 ≈ {format_money(snap['today_used'], snap['currency'])}"
+                f"（按余额差观测）\n观测时间：{snap['updated_at'] or '—'}",
+                secs=9)
+        elif fallback:
+            self.window.show_bubble(fallback, secs=6)
+
+    def _drain_balance_events(self) -> None:
+        for kind, payload in self.balance.drain():
+            if kind == "balance_ok":
+                if self.balance.check_low():
+                    snap = self.balance.snapshot() or {}
+                    self.window.show_bubble(self.narrator.line(
+                        "balance_low",
+                        balance=format_money(snap.get("balance", 0.0),
+                                             snap.get("currency", "CNY"))))
+                if self._manual_balance:
+                    self._manual_balance = False
+                    self._show_balance_snapshot()
+            elif kind == "balance_err":
+                self._log(f"[balance] 查询失败：{payload}")
+                if self._manual_balance:
+                    self._manual_balance = False
+                    self.window.show_bubble(
+                        "余额查询失败（网络或密钥问题，详见 log.txt）", secs=7)
+
+    def _toggle_alert(self) -> bool:
+        cur = bool(self.cfg["balance"].get("alert_enabled", True))
+        self.cfg["balance"]["alert_enabled"] = not cur
+        self._save_cfg()
+        if cur:
+            self.window.show_bubble("余额预警已关闭。")
+            return False
+        try:
+            thr = float(self.cfg["balance"].get("low_alert", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            thr = 0.0
+        if thr <= 0:
+            self.window.show_bubble(
+                "余额预警已开启，但阈值还是 0：\n改 config.json 的 "
+                "balance.low_alert 为正数后才会真的提醒。", secs=10)
+        else:
+            self.window.show_bubble(f"余额预警已开启：低于 {thr:g} 时提醒你。")
+        return True
+
+    # ------------------------------------------------------------ 剩余积分
+
+    def _credits_click(self, key: str = "") -> None:
+        """点某家=先亮出缓存详情再刷新那一家；key 为空=全部刷新。"""
+        if not self.credits.conf.get("enabled", True):
+            self.window.show_bubble(
+                "剩余积分已在 config.json 里关闭（credits.enabled = false）。",
+                secs=7)
+            return
+        if not self.credits.enabled():
+            self.window.show_bubble(
+                "四家积分查询都被单独关掉了（config.json → credits.providers）。",
+                secs=7)
+            return
+        if key:
+            self._show_credits_detail(key)
+        if self.credits.maybe_poll(force=True, keys=[key] if key else None):
+            self._manual_credits = True
+            if not key:
+                self.window.show_bubble("正在查询四家剩余积分……", secs=5)
+        else:
+            self.window.show_bubble("积分查询正忙，稍等再点一次。", secs=5)
+
+    def _show_credits_detail(self, key: str) -> None:
+        r = self.credits.results.get(key) or {}
+        label = next((p.label for p in self.credits.providers if p.key == key),
+                     key)
+        lines = r.get("lines") or []
+        body = "\n".join(lines) if lines else (r.get("summary") or "暂无详情")
+        at = r.get("at", "")
+        tail = f"\n（{at}）" if at else ""
+        self.window.show_bubble(f"{label}\n{body}{tail}", secs=12)
+
+    def _drain_credits_events(self) -> None:
+        for kind, keys, err in self.credits.drain():
+            if kind != "credits_done":
+                continue
+            if err:
+                self._log(f"[credits] 轮询异常：{err}")
+            manual, self._manual_credits = self._manual_credits, False
+            if not manual:
+                # 后台轮询的失败也留个痕，方便排查
+                for k, r in self.credits.results.items():
+                    if r.get("status") == "err":
+                        self._log(f"[credits] {k}：{r.get('summary', '')}")
+                continue
+            picked = keys or [p.key for p in self.credits.providers]
+            if len(picked) == 1:
+                self._show_credits_detail(picked[0])
+                return
+            lines = []
+            for p in self.credits.providers:
+                if p.key in picked:
+                    lines.append(f"{p.label}：{self.credits.short_of(p.key) or '—'}")
+            self.window.show_bubble("\n".join(lines) or "没有可显示的积分数据。",
+                                    secs=11)
+
+    # ------------------------------------------------------------ GitHub 云端
+
+    def _github_click(self) -> None:
+        if not self.github.enabled():
+            self.window.show_bubble(
+                "GitHub 连接已在 config.json 里关闭（github.enabled = false）。",
+                secs=7)
+            return
+        if self.github.maybe_poll(self.state.gh_last_event_id, force=True):
+            self._manual_github = True
+            self.window.show_bubble("正在连接 GitHub……", secs=5)
+        else:
+            self.window.show_bubble("GitHub 查询正忙，稍等再点一次。", secs=5)
+
+    def _show_github_summary(self, payload: dict) -> None:
+        login = payload.get("login") or "?"
+        mode = payload.get("mode")
+        mode_txt = ("登录态（含私有仓库）" if mode == "token"
+                    else "匿名（只有公开数据）")
+        lines = [f"🐙 GitHub：@{login}", f"已连接 · {mode_txt}"]
+        today = payload.get("today_pushes")
+        if isinstance(today, int):
+            lines.append(f"今日推送 {today} 个 commit")
+        if payload.get("fed"):
+            lines.append(f"本次云端投喂 +{payload['fed']} 个 commit")
+        if payload.get("recent"):
+            lines.append("最近：" + "、".join(list(payload["recent"])[:3]))
+        if payload.get("note"):
+            lines.append(str(payload["note"]))
+        if payload.get("at"):
+            lines.append(f"（{payload['at']}）")
+        self.window.show_bubble("\n".join(lines), secs=12)
+
+    def _drain_github_events(self) -> None:
+        for kind, payload in self.github.drain():
+            if kind != "github_done":
+                continue
+            st = payload.get("status")
+            if st in ("ok", "baseline"):
+                manual, self._manual_github = self._manual_github, False
+                self.state.connect_github(str(payload.get("login") or ""))
+                cur = str(payload.get("cursor") or "")
+                if cur and cur != self.state.gh_last_event_id:
+                    self.state.gh_last_event_id = cur
+                    self.state.dirty = True
+                fed = int(payload.get("fed") or 0)
+                if fed > 0:
+                    repos = list((payload.get("fed_repos") or {}).keys())
+                    self.state.feed(fed, remote=True, repos=repos)
+                self._drain_events()     # 立刻把 gh_connected / gh_feed 台词吐出来
+                if manual:
+                    self._show_github_summary(payload)
+            else:
+                note = payload.get("note") or "连接异常"
+                self._log(f"[github] {note}")
+                if self._manual_github:
+                    self._manual_github = False
+                    self.window.show_bubble(f"GitHub：{note}", secs=10)
+
+    # ------------------------------------------------------------ 交互设置
+
+    def _toggle_snap(self) -> bool:
+        cur = bool(self.cfg.get("snap", True))
+        self.cfg["snap"] = not cur
+        self._save_cfg()
+        self.window.snap_enabled = not cur
+        if cur:
+            self.window.show_bubble("贴边吸附已关闭（自由摆放）。")
+        else:
+            self.window.show_bubble("贴边吸附已开启：拖到屏幕边缘松手会吸附，"
+                                    "贴左时水平镜像。")
+        return not cur
+
+    def _set_sound(self, value: str) -> None:
+        if value == "off":
+            self.sound.set_enabled(False)
+            self.cfg["sound"]["enabled"] = False
+            self.window.show_bubble("音效已关闭。")
+        else:
+            self.sound.set_pack(value)
+            self.sound.set_enabled(True)
+            self.cfg["sound"]["enabled"] = True
+            self.cfg["sound"]["pack"] = value
+            self.window.show_bubble(f"音效已切换：{PACKS[value]['name']}。")
+        self._save_cfg()
+
+    def _sound_pack_state(self) -> str:
+        return self.sound.pack if self.sound.enabled else "off"
+
+    def _save_cfg(self) -> None:
+        try:
+            save_config(self.cfg, self.config_dir)
+        except OSError as e:
+            self._log(f"[config] 写回失败：{e!r}")
+
     # ------------------------------------------------------------ 生命周期
 
     def _save(self) -> None:
@@ -343,6 +633,7 @@ class HabitPetApp:
     def _quit(self) -> None:
         try:
             self._save()
+            self.sound.close()
         finally:
             self.window.destroy()
 
@@ -357,6 +648,11 @@ class HabitPetApp:
             "repos": self.cfg["repos"],
             "llm_enabled": self.cfg["llm"].get("enabled"),
             "has_key": bool(self.narrator._api_key()),
+            "sound": {"enabled": self.sound.enabled, "pack": self.sound.pack},
+            "balance": self.balance.snapshot(),
+            "balance_key": bool(self.balance.key),
+            "credits": self.credits.smoke_summary(),
+            "github": self.github.smoke_summary(),
         }
         self._save()
         print(json.dumps(info, ensure_ascii=False, indent=2))

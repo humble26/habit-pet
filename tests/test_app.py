@@ -19,6 +19,11 @@ def make_app() -> tuple[HabitPetApp, PetWindow, Path]:
     cfgdir = Path(tempfile.mkdtemp(prefix="habitpet_app_"))
     (cfgdir / "config.json").write_text(json.dumps({
         "repos": [], "git_poll_seconds": 300, "llm": {"enabled": False},
+        # 测试环境不发真实请求、不出声音
+        "sound": {"enabled": False},
+        "balance": {"enabled": False},
+        "credits": {"enabled": False},
+        "github": {"enabled": False},
     }, ensure_ascii=False), encoding="utf-8")
     w = PetWindow(callbacks={})
     w.withdraw()

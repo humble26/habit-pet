@@ -4,7 +4,7 @@
 让弃养成本变成养成记录清零。"
 
 三个部分：
-- 成长阶段：成长值 = commit 数 + 活跃天数×5，阶段只升不降（幼猫 → 成猫 → 大猫）
+- 成长阶段：成长值 = commit 数 + 活跃天数×5，阶段只升不降（幼鲸 → 鲸鱼娘 → 深海鲸鱼娘）
 - 连续活跃 streak：每天有 commit 或伏案 ≥30 分钟记为活跃天，跨天时结算
 - 成就：一次性里程碑，解锁即永久保存
 """
@@ -23,9 +23,9 @@ STREAK_MILESTONES = (3, 7, 14, 30, 60, 100)
 
 # (名称, 所需成长值, 绘制缩放)
 STAGES: list[tuple[str, int, float]] = [
-    ("幼猫", 0, 0.82),
-    ("成猫", 20, 1.0),
-    ("大猫", 100, 1.14),
+    ("幼鲸", 0, 0.82),
+    ("鲸鱼娘", 20, 1.0),
+    ("深海鲸鱼娘", 100, 1.14),
 ]
 
 
@@ -111,15 +111,15 @@ def _companion_days(state: "PetState") -> int:
 
 
 ACHIEVEMENTS: list[Achievement] = [
-    Achievement("first_feed", "开饭初心", "第一次用 commit 喂食",
+    Achievement("first_feed", "初见鲸喜", "第一次用 commit 喂食",
                 lambda s: s.total_commits >= 1),
-    Achievement("commits_10", "青铜铲屎官", "累计喂食 10 个 commit",
+    Achievement("commits_10", "青铜饲养员", "累计喂食 10 个 commit",
                 lambda s: s.total_commits >= 10),
-    Achievement("commits_50", "白银铲屎官", "累计喂食 50 个 commit",
+    Achievement("commits_50", "白银饲养员", "累计喂食 50 个 commit",
                 lambda s: s.total_commits >= 50),
-    Achievement("commits_100", "黄金铲屎官", "累计喂食 100 个 commit",
+    Achievement("commits_100", "黄金饲养员", "累计喂食 100 个 commit",
                 lambda s: s.total_commits >= 100),
-    Achievement("commits_365", "王者铲屎官", "累计喂食 365 个 commit",
+    Achievement("commits_365", "王者饲养员", "累计喂食 365 个 commit",
                 lambda s: s.total_commits >= 365),
     Achievement("streak_3", "三日温存", "连续活跃 3 天",
                 lambda s: s.best_streak >= 3),
@@ -127,9 +127,9 @@ ACHIEVEMENTS: list[Achievement] = [
                 lambda s: s.best_streak >= 7),
     Achievement("streak_30", "月全勤", "连续活跃 30 天",
                 lambda s: s.best_streak >= 30),
-    Achievement("comeback", "破镜重圆", "被你气到离家出走，又回来了",
+    Achievement("comeback", "破镜重圆", "被你气到出海散心，又回来了",
                 lambda s: s.came_back_once),
-    Achievement("night_owl", "夜猫子认证", "累计陪你熬夜满 1 小时",
+    Achievement("night_owl", "夜航鲸认证", "累计陪你熬夜满 1 小时",
                 lambda s: s.total_late_minutes >= 60),
     Achievement("early_bird", "早鸟", "早上 6 点档就开始敲键盘",
                 lambda s: s.early_today),
@@ -146,6 +146,17 @@ ACHIEVEMENTS: list[Achievement] = [
                 lambda s: s.total_focus_count >= 10),
     Achievement("focus_50", "番茄大亨", "累计完成 50 次专注",
                 lambda s: s.total_focus_count >= 50),
+    # GitHub 云端（v0.6，远程投喂与多仓库激励）
+    Achievement("gh_connect", "接入云端", "鲸鱼娘连上了你的 GitHub 账号",
+                lambda s: bool(s.gh_login)),
+    Achievement("gh_remote_1", "深海快递", "收到第一次来自 GitHub 云端的投喂",
+                lambda s: s.gh_remote_commits >= 1),
+    Achievement("gh_remote_20", "云端饲养员", "云端累计投喂 20 个 commit",
+                lambda s: s.gh_remote_commits >= 20),
+    Achievement("gh_remote_100", "七海巡游", "云端累计投喂 100 个 commit",
+                lambda s: s.gh_remote_commits >= 100),
+    Achievement("gh_repos_5", "八爪鱼", "云端投喂来自 5 个不同的仓库",
+                lambda s: len(s.gh_repos_seen) >= 5),
 ]
 
 

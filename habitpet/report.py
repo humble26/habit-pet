@@ -20,7 +20,8 @@ def week_summary(state: PetState) -> dict:
             days.append(state.history.get(d, {"date": d, "commits": 0,
                                               "active_minutes": 0.0, "sit_hits": 0,
                                               "breaks": 0, "late_minutes": 0.0,
-                                              "roasts": 0, "focus_count": 0}))
+                                              "roasts": 0, "focus_count": 0,
+                                              "gh_pushes": 0}))
     total = {
         "commits": sum(d["commits"] for d in days),
         "active_hours": round(sum(d["active_minutes"] for d in days) / 60, 1),
@@ -28,6 +29,7 @@ def week_summary(state: PetState) -> dict:
         "breaks": sum(d["breaks"] for d in days),
         "late_hours": round(sum(d["late_minutes"] for d in days) / 60, 1),
         "focus_count": sum(d.get("focus_count", 0) for d in days),
+        "gh_pushes": sum(d.get("gh_pushes", 0) for d in days),
     }
     return {"days": days, "total": total}
 
@@ -37,7 +39,7 @@ def write_daily(state: PetState, roast: str, is_llm: bool, out_dir: Path) -> Pat
     now = dt.datetime.now()
     t = state.today
     lines = [
-        f"# 🐾 Habit Pet 日报 · {t.date}",
+        f"# 🐋 Habit Pet 日报 · 鲸鱼娘版 · {t.date}",
         "",
         f"> {roast}",
         f"> （{'LLM 生成' if is_llm else '离线模板'}）",
@@ -49,6 +51,7 @@ def write_daily(state: PetState, roast: str, is_llm: bool, out_dir: Path) -> Pat
         f"| 久坐扣血 | {t.sit_hits} 次 |",
         f"| 有效休息 | {t.breaks} 次 |",
         f"| 专注完成 | {t.focus_count} 颗番茄 |",
+        f"| 云端投喂 | {t.gh_pushes} 个 commit |",
         f"| 熬夜时长 | {t.late_minutes:.0f} 分钟 |",
         f"| 寿命上限 | {state.lifespan_max:.0f}/100 |",
         "",
@@ -68,7 +71,7 @@ def write_weekly(state: PetState, out_dir: Path, narrator: Narrator) -> Path:
     today = dt.date.today()
     week_no = today.isocalendar()[1]
     lines = [
-        f"# 🐾 Habit Pet 周报 · {today.year} 年第 {week_no} 周",
+        f"# 🐋 Habit Pet 周报 · 鲸鱼娘版 · {today.year} 年第 {week_no} 周",
         "",
         f"> {comment}",
         f"> （{'LLM 生成' if is_llm else '离线模板'}）",
@@ -78,6 +81,7 @@ def write_weekly(state: PetState, out_dir: Path, narrator: Narrator) -> Path:
         f"- commit 喂食：**{total['commits']}** 次",
         f"- 伏案活跃：**{total['active_hours']}** 小时",
         f"- 专注完成：**{total.get('focus_count', 0)}** 颗番茄",
+        f"- GitHub 云端投喂：**{total.get('gh_pushes', 0)}** 个 commit",
         f"- 久坐扣血：**{total['sit_hits']}** 次（休息 {total['breaks']} 次）",
         f"- 熬夜：**{total['late_hours']}** 小时",
         "",

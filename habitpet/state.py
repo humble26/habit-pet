@@ -2,7 +2,7 @@
 
 数值设计对应《前景报告 05》的产品设计：
 - 饱食度：git commit 喂食，随时间自然衰减
-- 心情：撸猫 / 被 commit 喂食提升，缓慢衰减
+- 心情：摸摸头 / 被 commit 喂食提升，缓慢衰减
 - 健康度：连续伏案超阈值扣血，起身休息回复
 - 寿命上限：深夜（默认 0-6 点）仍活跃则缓慢下降，下限 30
 - 健康归零不判死亡 —— 离家出走三天，回来给你带不好吃的
@@ -25,9 +25,9 @@ MAX_CATCHUP_HOURS = 18.0       # 关机期间最多补算这么久的饥饿
 HISTORY_KEEP_DAYS = 35
 
 RUNAWAY_REASONS = [
-    "嫌你久坐不理它",
-    "饱食度见底还要陪你加班",
-    "被你凌晨的键盘声吵到崩溃",
+    "嫌你久坐都不来摸摸头",
+    "饿着肚子还要陪你加班",
+    "被你的凌晨键盘声吵到离家出海",
 ]
 
 
@@ -39,11 +39,12 @@ class DayStats:
     """单日行为统计，驱动日报/周报。"""
 
     __slots__ = ("date", "commits", "active_minutes", "sit_hits",
-                 "breaks", "late_minutes", "roasts", "focus_count")
+                 "breaks", "late_minutes", "roasts", "focus_count",
+                 "gh_pushes")
 
     def __init__(self, date: str, commits: int = 0, active_minutes: float = 0.0,
                  sit_hits: int = 0, breaks: int = 0, late_minutes: float = 0.0,
-                 roasts: int = 0, focus_count: int = 0) -> None:
+                 roasts: int = 0, focus_count: int = 0, gh_pushes: int = 0) -> None:
         self.date = date
         self.commits = commits
         self.active_minutes = active_minutes
@@ -52,6 +53,7 @@ class DayStats:
         self.late_minutes = late_minutes
         self.roasts = roasts
         self.focus_count = focus_count
+        self.gh_pushes = gh_pushes       # 当天来自 GitHub 云端的远程投喂
 
     @classmethod
     def for_day(cls, d: dt.date) -> "DayStats":
@@ -64,6 +66,7 @@ class DayStats:
             "sit_hits": self.sit_hits, "breaks": self.breaks,
             "late_minutes": round(self.late_minutes, 1),
             "roasts": self.roasts, "focus_count": self.focus_count,
+            "gh_pushes": self.gh_pushes,
         }
 
     @classmethod
@@ -77,6 +80,7 @@ class DayStats:
             late_minutes=float(d.get("late_minutes", 0.0)),
             roasts=int(d.get("roasts", 0)),
             focus_count=int(d.get("focus_count", 0)),
+            gh_pushes=int(d.get("gh_pushes", 0)),
         )
 
 
@@ -118,6 +122,11 @@ class PetState:
         self.early_today = False
         self.unlocked: dict[str, str] = {}
         self.stage_idx = 0
+        # GitHub 云端连接（轮询逻辑见 collectors/github.py）
+        self.gh_login = ""
+        self.gh_last_event_id = ""       # 已消费到的事件游标（远程投喂去重）
+        self.gh_remote_commits = 0       # 云端累计投喂的 commit 数
+        self.gh_repos_seen: list[str] = []   # 云端投喂过的仓库（激励多仓库）
         # 专注模式（会话本身不持久化，重启即取消）
         self.focus: Optional[FocusSession] = None
         self.total_focus_count = 0
@@ -135,8 +144,9 @@ class PetState:
 
     # ------------------------------------------------------------------ 事件
 
-    def feed(self, commits: int) -> None:
-        """git 提交喂食。"""
+    def feed(self, commits: int, remote: bool = False,
+             repos: Optional[list[str]] = None) -> None:
+        """git 提交喂食。remote=True 表示来自 GitHub 云端事件（远程投喂）。"""
         if commits <= 0 or self.runaway_until:
             return
         m = self.mechanics
@@ -145,9 +155,30 @@ class PetState:
         self.total_commits += commits
         self.today.commits += commits
         self._hungry_notified = False
-        self.events.append({"kind": "feed", "n": commits})
+        if remote:
+            self.gh_remote_commits += commits
+            self.today.gh_pushes += commits
+            for r in repos or []:
+                if r and r not in self.gh_repos_seen and len(self.gh_repos_seen) < 200:
+                    self.gh_repos_seen.append(r)
+            self.events.append({"kind": "gh_feed", "n": commits,
+                                "repos": "、".join((repos or [])[:3]) or "云端",
+                                "total": self.gh_remote_commits})
+        else:
+            self.events.append({"kind": "feed", "n": commits})
         self._growth_tick()
         self.dirty = True
+
+    def connect_github(self, login: str) -> bool:
+        """记录云端账号；首次接入会触发成就事件。返回是否是新账号。"""
+        login = (login or "").strip()
+        if not login or login == self.gh_login:
+            return False
+        self.gh_login = login
+        self.events.append({"kind": "gh_connected", "login": login})
+        self._growth_tick()
+        self.dirty = True
+        return True
 
     def treat(self) -> None:
         """手动喂一包粮（右键菜单），不计入 commit。"""
@@ -161,7 +192,7 @@ class PetState:
         self.dirty = True
 
     def pet_me(self) -> None:
-        """撸猫。"""
+        """摸摸头。"""
         if self.runaway_until:
             self.events.append({"kind": "pet_runaway"})
             return
@@ -341,7 +372,7 @@ class PetState:
 
     def status_lines(self, now: dt.datetime) -> list[str]:
         lines = [
-            f"🐾 {growth.stage_name(self)} · 陪伴 {(now - dt.datetime.fromisoformat(self.born_at)).days + 1} 天",
+            f"🐋 {growth.stage_name(self)} · 陪伴 {(now - dt.datetime.fromisoformat(self.born_at)).days + 1} 天",
             f"饱食度 {self._bar(self.satiety)} {self.satiety:.0f}",
             f"心情   {self._bar(self.mood)} {self.mood:.0f}",
             f"健康   {self._bar(self.health)} {self.health:.0f}",
@@ -350,6 +381,9 @@ class PetState:
             f"成长值 {growth.growth_points(self)}",
             f"累计 commit 喂食 {self.total_commits} 次",
         ]
+        if self.gh_login:
+            lines.append(f"🐙 GitHub @{self.gh_login} · 云端累计投喂 "
+                         f"{self.gh_remote_commits} 个 commit")
         if self.focus:
             left = self.focus.remaining_minutes()
             paused = "（已暂停）" if self.focus.paused else ""
@@ -412,6 +446,10 @@ class PetState:
             "unlocked": self.unlocked,
             "stage_idx": self.stage_idx,
             "total_focus_count": self.total_focus_count,
+            "gh_login": self.gh_login,
+            "gh_last_event_id": self.gh_last_event_id,
+            "gh_remote_commits": self.gh_remote_commits,
+            "gh_repos_seen": self.gh_repos_seen[-200:],
             "today": self.today.to_dict(),
             "history": self.history,
         }
@@ -451,6 +489,7 @@ class PetState:
             st.stage_idx = min(max(int(data.get("stage_idx", 0)), 0),
                                len(growth.STAGES) - 1)
             st.total_focus_count = int(data.get("total_focus_count", 0))
+            st.gh_remote_commits = int(data.get("gh_remote_commits", 0))
             st.today = DayStats.from_dict(data.get("today", {}))
             st.history = dict(data.get("history", {}))
         except (TypeError, ValueError):
@@ -462,6 +501,13 @@ class PetState:
         st.last_roast_date = str(data.get("last_roast_date", "") or "")
         st.last_save = _safe_iso(data.get("last_save"), None)
         st.last_poll = _safe_iso(data.get("last_poll"), None)
+        st.gh_login = str(data.get("gh_login", "") or "")
+        st.gh_last_event_id = str(data.get("gh_last_event_id", "") or "")
+        try:
+            st.gh_repos_seen = [str(x) for x in
+                                (data.get("gh_repos_seen") or [])][-200:]
+        except TypeError:
+            st.gh_repos_seen = []
         if not st.today.date:
             st.today = DayStats.for_day(dt.date.today())
         return st
